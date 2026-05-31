@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock is kept for binaries (intentional)
+# Cargo.lock
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Runtime
+vortex.toml
+*.sock

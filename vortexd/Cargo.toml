@@ -1,0 +1,34 @@
+[package]
+name = "vortexd"
+version = "0.1.0"
+edition = "2021"
+description = "Headless automation orchestrator daemon"
+license = "MIT"
+repository = "https://github.com/EugeneShtoka/vortex"
+keywords = ["automation", "orchestration", "daemon", "pipeline"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "vortexd"
+path = "src/main.rs"
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+evalexpr = "11"
+handlebars = "6"
+rusqlite = { version = "0.31", features = ["bundled"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"

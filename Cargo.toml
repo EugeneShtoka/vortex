@@ -1,0 +1,3 @@
+[workspace]
+members = ["vortex-core", "vortexd", "vortex-tui"]
+resolver = "2"
