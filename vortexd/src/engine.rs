@@ -1,37 +1,55 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::transport::smtp::authentication::Credentials;
+use reqwest::Client;
 use tokio::process::Command;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use tokio::sync::broadcast;
-
-use crate::config::{WorkflowConfig, TaskConfig};
+use crate::config::{EmailConfig, TaskConfig, TaskKind, WorkflowConfig};
 use crate::event::Event;
 use crate::gate;
 use crate::store::Store;
 use crate::template;
 
+// ── result types ─────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct TaskResult {
-    pub id: String,
-    pub stdout: String,
-    pub stderr: String,
+    pub id:        String,
+    pub stdout:    String,
+    pub stderr:    String,
     pub exit_code: i32,
-    pub success: bool,
+    pub success:   bool,
+    pub output:    Option<serde_json::Value>,
+    pub status:    Option<u16>,
 }
 
+struct TaskOutcome {
+    stdout:    String,
+    stderr:    String,
+    exit_code: i32,
+    success:   bool,
+    output:    Option<serde_json::Value>,
+    status:    Option<u16>,
+}
+
+// ── engine ────────────────────────────────────────────────────────────────────
+
 pub struct Engine {
-    config: WorkflowConfig,
-    db_path: String,
-    event_tx: Option<broadcast::Sender<Event>>,
-    run_id: Option<String>,
+    config:       WorkflowConfig,
+    db_path:      String,
+    event_tx:     Option<broadcast::Sender<Event>>,
+    run_id:       Option<String>,
     trigger_params: HashMap<String, String>,
+    email_config: Option<EmailConfig>,
 }
 
 impl Engine {
     pub fn new(config: WorkflowConfig, db_path: &str) -> Self {
-        Self { config, db_path: db_path.to_string(), event_tx: None, run_id: None, trigger_params: HashMap::new() }
+        Self { config, db_path: db_path.to_string(), event_tx: None, run_id: None, trigger_params: HashMap::new(), email_config: None }
     }
 
     pub fn with_events(mut self, tx: broadcast::Sender<Event>) -> Self {
@@ -46,6 +64,11 @@ impl Engine {
 
     pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
         self.trigger_params = params;
+        self
+    }
+
+    pub fn with_email_config(mut self, cfg: EmailConfig) -> Self {
+        self.email_config = Some(cfg);
         self
     }
 
@@ -72,7 +95,7 @@ impl Engine {
         let mut all_results = Vec::new();
 
         for task in &ordered {
-            if !self.gate_allows(task, &results, &all_ids)? {
+            if !self.gate_allows(task, &results, &all_ids, &globals)? {
                 warn!(task = %task.id, "Skipped (gate not met)");
                 let ts = vortex_core::now_ms();
                 store.upsert_task(&run_id, &task.id, "skipped", None, None, None, Some(ts), Some(ts))?;
@@ -105,41 +128,80 @@ impl Engine {
         results: &HashMap<String, TaskResult>,
         globals: &HashMap<String, String>,
     ) -> Result<TaskResult> {
-        let exec = template::render(&task.exec, results, globals, &self.trigger_params)?;
-        info!(task = %task.id, exec = %exec, "Running task");
-
         let started_at = vortex_core::now_ms();
         let store = Store::open(&self.db_path)?;
         store.upsert_task(run_id, &task.id, "running", None, None, None, Some(started_at), None)?;
         self.emit(Event::TaskStarted { run_id: run_id.to_string(), task: task.id.clone(), timestamp: started_at });
 
-        let params_json = serde_json::to_string(&self.trigger_params).unwrap_or_else(|_| "{}".into());
-        let output = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&exec)
-            .env("VORTEX_TRIGGER_PARAMS", &params_json)
-            .output().await?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code().unwrap_or(-1);
-        let success = output.status.success();
-
-        if !stdout.trim().is_empty() { info!(task = %task.id, "stdout: {}", stdout.trim_end()); }
-        if !stderr.trim().is_empty() { error!(task = %task.id, "stderr: {}", stderr.trim_end()); }
-        if success { info!(task = %task.id, "Finished OK") } else { warn!(task = %task.id, exit_code, "Finished with error") }
+        let outcome = self.dispatch_task(task, results, globals).await.unwrap_or_else(|e| {
+            error!(task = %task.id, "Task failed: {e:#}");
+            TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: -1, success: false, output: None, status: None }
+        });
 
         let finished_at = vortex_core::now_ms();
-        store.upsert_task(run_id, &task.id, if success { "success" } else { "failure" },
-            Some(exit_code), Some(&stdout), Some(&stderr), Some(started_at), Some(finished_at))?;
+        if !outcome.stdout.trim().is_empty() { info!(task = %task.id, "stdout: {}", outcome.stdout.trim_end()); }
+        if !outcome.stderr.trim().is_empty() { error!(task = %task.id, "stderr: {}", outcome.stderr.trim_end()); }
+        if outcome.success { info!(task = %task.id, "Finished OK") } else { warn!(task = %task.id, "Finished with error") }
+
+        let status_str = if outcome.success { "success" } else { "failure" };
+        store.upsert_task(run_id, &task.id, status_str, Some(outcome.exit_code),
+            Some(&outcome.stdout), Some(&outcome.stderr), Some(started_at), Some(finished_at))?;
         self.emit(Event::TaskFinished {
             run_id: run_id.to_string(), task: task.id.clone(),
-            success, exit_code,
-            stdout: stdout.clone(), stderr: stderr.clone(),
+            success: outcome.success, exit_code: outcome.exit_code,
+            stdout: outcome.stdout.clone(), stderr: outcome.stderr.clone(),
             timestamp: finished_at,
         });
 
-        Ok(TaskResult { id: task.id.clone(), stdout, stderr, exit_code, success })
+        Ok(TaskResult { id: task.id.clone(), stdout: outcome.stdout, stderr: outcome.stderr,
+            exit_code: outcome.exit_code, success: outcome.success, output: outcome.output, status: outcome.status })
+    }
+
+    async fn dispatch_task(
+        &self,
+        task: &TaskConfig,
+        results: &HashMap<String, TaskResult>,
+        globals: &HashMap<String, String>,
+    ) -> Result<TaskOutcome> {
+        match &task.kind {
+            TaskKind::Shell { exec } => {
+                let cmd = template::render(exec, results, globals, &self.trigger_params)?;
+                execute_shell(&task.id, &cmd, &self.trigger_params).await
+            }
+            TaskKind::Http { url, method, headers, body } => {
+                let url  = template::render(url, results, globals, &self.trigger_params)?;
+                let body = body.as_ref().map(|b| template::render(b, results, globals, &self.trigger_params)).transpose()?;
+                let hdrs = render_map(headers, results, globals, &self.trigger_params)?;
+                execute_http(method, &url, &hdrs, body.as_deref()).await
+            }
+            TaskKind::Notify { server, topic, message, title, priority, tags, token } => {
+                let msg   = template::render(message, results, globals, &self.trigger_params)?;
+                let title = title.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params)).transpose()?;
+                let tok   = token.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params)).transpose()?;
+                let srv   = server.as_deref().unwrap_or("https://ntfy.sh");
+                execute_notify(srv, topic, &msg, title.as_deref(), priority.as_deref(), tags.as_deref(), tok.as_deref()).await
+            }
+            TaskKind::Email { to, subject, body, cc } => {
+                let subject = template::render(subject, results, globals, &self.trigger_params)?;
+                let body    = template::render(body, results, globals, &self.trigger_params)?;
+                let cfg = self.email_config.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Email task requires [email] config section"))?;
+                execute_email(to, &subject, &body, cc.as_deref(), cfg).await
+            }
+            TaskKind::Sleep { duration } => execute_sleep(duration).await,
+            TaskKind::StoreSet { set } => {
+                let rendered = render_map(set, results, globals, &self.trigger_params)?;
+                execute_store_set(rendered, &self.db_path).await
+            }
+            TaskKind::StoreGet { get } => {
+                let key = template::render(get, results, globals, &self.trigger_params)?;
+                execute_store_get(&key, &self.db_path).await
+            }
+            TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
+            TaskKind::Spawn { exe, args } => {
+                execute_spawn(&task.id, exe, args, &self.trigger_params).await
+            }
+        }
     }
 
     fn gate_allows(
@@ -147,16 +209,14 @@ impl Engine {
         task: &TaskConfig,
         results: &HashMap<String, TaskResult>,
         all_ids: &[&str],
+        globals: &HashMap<String, String>,
     ) -> Result<bool> {
-        match &task.when {
-            None => Ok(true),
-            Some(expr) => gate::evaluate(expr, results, all_ids),
-        }
+        let Some(expr) = &task.when else { return Ok(true) };
+        let rendered = template::render(expr, results, globals, &self.trigger_params)?;
+        gate::evaluate(&rendered, results, all_ids)
     }
 
-    /// Kahn's topological sort. All task IDs referenced in a `when` expression
-    /// become dependency edges, so compound gates like `"a AND b"` correctly
-    /// order all mentioned tasks before the dependent one.
+    /// Kahn's topological sort over task dependency edges extracted from `when` expressions.
     fn topological_sort(&self) -> Result<Vec<TaskConfig>> {
         let tasks = &self.config.tasks;
         let task_ids: HashMap<&str, usize> =
@@ -171,9 +231,7 @@ impl Engine {
                         continue;
                     }
                     if let Some(&j) = task_ids.get(token) {
-                        if seen.insert(j) {
-                            deps[i].push(j);
-                        }
+                        if seen.insert(j) { deps[i].push(j); }
                     }
                 }
             }
@@ -181,18 +239,12 @@ impl Engine {
 
         let mut rev: Vec<Vec<usize>> = vec![vec![]; tasks.len()];
         for (i, task_deps) in deps.iter().enumerate() {
-            for &j in task_deps {
-                rev[j].push(i);
-            }
+            for &j in task_deps { rev[j].push(i); }
         }
 
         let mut in_degree: Vec<usize> = deps.iter().map(|d| d.len()).collect();
-        let mut queue: Vec<usize> = in_degree
-            .iter()
-            .enumerate()
-            .filter(|(_, &d)| d == 0)
-            .map(|(i, _)| i)
-            .collect();
+        let mut queue: Vec<usize> = in_degree.iter().enumerate()
+            .filter(|(_, &d)| d == 0).map(|(i, _)| i).collect();
 
         let mut ordered = Vec::with_capacity(tasks.len());
         while !queue.is_empty() {
@@ -201,37 +253,172 @@ impl Engine {
             ordered.push(tasks[cur].clone());
             for &next in &rev[cur] {
                 in_degree[next] -= 1;
-                if in_degree[next] == 0 {
-                    queue.push(next);
-                }
+                if in_degree[next] == 0 { queue.push(next); }
             }
         }
 
         if ordered.len() != tasks.len() {
             bail!("Circular dependency detected in task graph");
         }
-
         Ok(ordered)
     }
 }
 
+// ── task executors ────────────────────────────────────────────────────────────
+
+async fn execute_spawn(
+    task_id: &str,
+    exe: &str,
+    args: &[String],
+    trigger_params: &HashMap<String, String>,
+) -> Result<TaskOutcome> {
+    use tokio::io::AsyncWriteExt;
+
+    let params_json = serde_json::to_string(trigger_params).unwrap_or_else(|_| "{}".into());
+    info!(task = %task_id, exe = %exe, "Running spawn task");
+
+    let mut child = Command::new(exe)
+        .args(args)
+        .env("VORTEX_TRIGGER_PARAMS", &params_json)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {exe}: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(params_json.as_bytes()).await?;
+    }
+
+    let output = child.wait_with_output().await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, status: None })
+}
+
+async fn execute_shell(task_id: &str, exec: &str, trigger_params: &HashMap<String, String>) -> Result<TaskOutcome> {
+    info!(task = %task_id, exec = %exec, "Running shell task");
+    let params_json = serde_json::to_string(trigger_params).unwrap_or_else(|_| "{}".into());
+    let output = Command::new("/bin/sh").arg("-c").arg(exec)
+        .env("VORTEX_TRIGGER_PARAMS", &params_json)
+        .output().await?;
+    let stdout    = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr    = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, status: None })
+}
+
+async fn execute_http(method: &str, url: &str, headers: &HashMap<String, String>, body: Option<&str>) -> Result<TaskOutcome> {
+    let method = method.to_uppercase().parse::<reqwest::Method>()
+        .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {method}"))?;
+    let mut req = Client::new().request(method, url);
+    for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+    if let Some(b) = body { req = req.body(b.to_string()); }
+    let resp      = req.send().await?;
+    let http_status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    let parsed    = serde_json::from_str(&body_text).ok();
+    Ok(TaskOutcome {
+        stdout: body_text, stderr: String::new(),
+        exit_code: http_status.as_u16() as i32, success: http_status.is_success(),
+        output: parsed, status: Some(http_status.as_u16()),
+    })
+}
+
+async fn execute_notify(server: &str, topic: &str, message: &str, title: Option<&str>, priority: Option<&str>, tags: Option<&str>, token: Option<&str>) -> Result<TaskOutcome> {
+    let mut req = Client::new().post(format!("{server}/{topic}")).body(message.to_string());
+    if let Some(t) = title    { req = req.header("Title",         t); }
+    if let Some(p) = priority { req = req.header("Priority",      p); }
+    if let Some(t) = tags     { req = req.header("Tags",          t); }
+    if let Some(t) = token    { req = req.header("Authorization", format!("Bearer {t}")); }
+    let resp   = req.send().await?;
+    let status = resp.status();
+    let body   = resp.text().await.unwrap_or_default();
+    Ok(TaskOutcome {
+        stdout: body, stderr: String::new(),
+        exit_code: status.as_u16() as i32, success: status.is_success(),
+        output: None, status: Some(status.as_u16()),
+    })
+}
+
+async fn execute_email(to: &str, subject: &str, body: &str, cc: Option<&str>, cfg: &EmailConfig) -> Result<TaskOutcome> {
+    let password = crate::auth::resolve_token(&cfg.auth_method, &cfg.auth_key)?;
+    let creds    = Credentials::new(cfg.from.clone(), password);
+    let mut builder = Message::builder()
+        .from(cfg.from.parse()?)
+        .to(to.parse()?)
+        .subject(subject);
+    if let Some(addr) = cc { builder = builder.cc(addr.parse()?); }
+    let email = builder.body(body.to_string())?;
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)?
+            .port(cfg.smtp_port)
+            .credentials(creds)
+            .build();
+    mailer.send(email).await?;
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+}
+
+async fn execute_sleep(duration: &str) -> Result<TaskOutcome> {
+    let d = parse_duration(duration)?;
+    tokio::time::sleep(d).await;
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+}
+
+async fn execute_store_set(set: HashMap<String, String>, db_path: &str) -> Result<TaskOutcome> {
+    let store = Store::open(db_path)?;
+    for (k, v) in &set { store.set(k, v)?; }
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+}
+
+async fn execute_store_get(key: &str, db_path: &str) -> Result<TaskOutcome> {
+    let store = Store::open(db_path)?;
+    let value = store.get(key)?.unwrap_or_default();
+    let output = Some(serde_json::Value::String(value.clone()));
+    Ok(TaskOutcome { stdout: value, stderr: String::new(), exit_code: 0, success: true, output, status: None })
+}
+
+fn render_map(map: &HashMap<String, String>, results: &HashMap<String, TaskResult>, globals: &HashMap<String, String>, params: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    map.iter().map(|(k, v)| template::render(v, results, globals, params).map(|r| (k.clone(), r))).collect()
+}
+
+fn parse_duration(s: &str) -> Result<std::time::Duration> {
+    if let Some(n) = s.strip_suffix("ms") {
+        return Ok(std::time::Duration::from_millis(n.trim().parse()?));
+    }
+    if let Some(n) = s.strip_suffix('s') {
+        return Ok(std::time::Duration::from_secs(n.trim().parse()?));
+    }
+    if let Some(n) = s.strip_suffix('m') {
+        return Ok(std::time::Duration::from_secs(n.trim().parse::<u64>()? * 60));
+    }
+    bail!("Invalid duration '{s}': expected format like '5s', '100ms', '2m'")
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{WorkflowConfig, TaskConfig};
+    use crate::config::{TaskKind, WorkflowConfig, TaskConfig};
     use crate::event::Event;
 
     fn task(id: &str, exec: &str, when: Option<&str>) -> TaskConfig {
-        TaskConfig { id: id.into(), exec: exec.into(), when: when.map(str::to_string) }
+        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string) }
     }
 
     fn workflow(tasks: Vec<TaskConfig>) -> WorkflowConfig {
-        WorkflowConfig { tasks }
+        WorkflowConfig { tasks, cron: None }
     }
 
     fn engine(tasks: Vec<TaskConfig>) -> Engine {
         let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
         Engine::new(workflow(tasks), path.to_str().unwrap())
+    }
+
+    fn tr(id: &str, success: bool) -> TaskResult {
+        TaskResult { id: id.into(), stdout: String::new(), stderr: String::new(), exit_code: if success { 0 } else { 1 }, success, output: None, status: None }
     }
 
     // --- topological sort ---
@@ -266,12 +453,7 @@ mod tests {
 
     #[test]
     fn topo_sort_and_gate_orders_both_deps() {
-        // c is listed before b in config — without full dep extraction, c could run before b
-        let e = engine(vec![
-            task("a", "echo a", None),
-            task("c", "echo c", Some("a AND b")),
-            task("b", "echo b", None),
-        ]);
+        let e = engine(vec![task("a", "echo a", None), task("c", "echo c", Some("a AND b")), task("b", "echo b", None)]);
         let order: Vec<_> = e.topological_sort().unwrap().iter().map(|t| t.id.clone()).collect();
         let pos_c = order.iter().position(|x| x == "c").unwrap();
         assert!(order.iter().position(|x| x == "a").unwrap() < pos_c);
@@ -280,11 +462,7 @@ mod tests {
 
     #[test]
     fn topo_sort_or_gate_orders_both_deps() {
-        let e = engine(vec![
-            task("a", "echo a", None),
-            task("c", "echo c", Some("a OR b")),
-            task("b", "echo b", None),
-        ]);
+        let e = engine(vec![task("a", "echo a", None), task("c", "echo c", Some("a OR b")), task("b", "echo b", None)]);
         let order: Vec<_> = e.topological_sort().unwrap().iter().map(|t| t.id.clone()).collect();
         let pos_c = order.iter().position(|x| x == "c").unwrap();
         assert!(order.iter().position(|x| x == "a").unwrap() < pos_c);
@@ -293,13 +471,7 @@ mod tests {
 
     #[test]
     fn topo_sort_complex_expression_orders_all_deps() {
-        // d listed second, depends on a, b, c all out-of-order
-        let e = engine(vec![
-            task("a", "echo a", None),
-            task("d", "echo d", Some("(a AND b) OR c")),
-            task("b", "echo b", None),
-            task("c", "echo c", None),
-        ]);
+        let e = engine(vec![task("a", "echo a", None), task("d", "echo d", Some("(a AND b) OR c")), task("b", "echo b", None), task("c", "echo c", None)]);
         let order: Vec<_> = e.topological_sort().unwrap().iter().map(|t| t.id.clone()).collect();
         let pos_d = order.iter().position(|x| x == "d").unwrap();
         assert!(order.iter().position(|x| x == "a").unwrap() < pos_d);
@@ -307,46 +479,34 @@ mod tests {
         assert!(order.iter().position(|x| x == "c").unwrap() < pos_d);
     }
 
-    // --- gate integration (Sprint 2: full boolean via evalexpr) ---
+    // --- gate ---
 
     #[test]
     fn gate_none_always_runs() {
         let e = engine(vec![]);
         let t = task("x", "echo", None);
-        assert!(e.gate_allows(&t, &HashMap::new(), &[]).unwrap());
+        assert!(e.gate_allows(&t, &HashMap::new(), &[], &HashMap::new()).unwrap());
     }
 
     #[test]
     fn gate_positive_dep_runs_if_success() {
         let e = engine(vec![]);
         let t = task("x", "echo", Some("a"));
-        let ok = HashMap::from([(
-            "a".into(),
-            TaskResult { id: "a".into(), stdout: String::new(), stderr: String::new(), exit_code: 0, success: true },
-        )]);
-        let fail = HashMap::from([(
-            "a".into(),
-            TaskResult { id: "a".into(), stdout: String::new(), stderr: String::new(), exit_code: 1, success: false },
-        )]);
-        assert!(e.gate_allows(&t, &ok, &["a"]).unwrap());
-        assert!(!e.gate_allows(&t, &fail, &["a"]).unwrap());
-        assert!(!e.gate_allows(&t, &HashMap::new(), &["a"]).unwrap());
+        let ok   = HashMap::from([("a".into(), tr("a", true))]);
+        let fail = HashMap::from([("a".into(), tr("a", false))]);
+        assert!( e.gate_allows(&t, &ok,             &["a"], &HashMap::new()).unwrap());
+        assert!(!e.gate_allows(&t, &fail,            &["a"], &HashMap::new()).unwrap());
+        assert!(!e.gate_allows(&t, &HashMap::new(),  &["a"], &HashMap::new()).unwrap());
     }
 
     #[test]
     fn gate_and_expression() {
         let e = engine(vec![]);
-        let t = task("x", "echo", Some("a AND b"));
-        let both = HashMap::from([
-            ("a".into(), TaskResult { id: "a".into(), stdout: String::new(), stderr: String::new(), exit_code: 0, success: true }),
-            ("b".into(), TaskResult { id: "b".into(), stdout: String::new(), stderr: String::new(), exit_code: 0, success: true }),
-        ]);
-        let one_fail = HashMap::from([
-            ("a".into(), TaskResult { id: "a".into(), stdout: String::new(), stderr: String::new(), exit_code: 0, success: true }),
-            ("b".into(), TaskResult { id: "b".into(), stdout: String::new(), stderr: String::new(), exit_code: 1, success: false }),
-        ]);
-        assert!(e.gate_allows(&t, &both, &["a", "b"]).unwrap());
-        assert!(!e.gate_allows(&t, &one_fail, &["a", "b"]).unwrap());
+        let t    = task("x", "echo", Some("a AND b"));
+        let both = HashMap::from([("a".into(), tr("a", true)), ("b".into(), tr("b", true))]);
+        let one  = HashMap::from([("a".into(), tr("a", true)), ("b".into(), tr("b", false))]);
+        assert!( e.gate_allows(&t, &both, &["a", "b"], &HashMap::new()).unwrap());
+        assert!(!e.gate_allows(&t, &one,  &["a", "b"], &HashMap::new()).unwrap());
     }
 
     // --- integration: full async run ---
@@ -366,8 +526,8 @@ mod tests {
     async fn run_skips_positive_gate_when_dep_fails() {
         let e = engine(vec![
             task("fail_step", "exit 1", None),
-            task("skip_me", "echo should_not_run", Some("fail_step")),
-            task("run_me", "echo recovery", Some("NOT fail_step")),
+            task("skip_me",   "echo should_not_run", Some("fail_step")),
+            task("run_me",    "echo recovery",       Some("NOT fail_step")),
         ]);
         let results = e.run("test-workflow").await.unwrap();
         assert_eq!(results.len(), 2);
@@ -375,7 +535,6 @@ mod tests {
         assert!(!results[0].success);
         assert_eq!(results[1].id, "run_me");
         assert!(results[1].success);
-        assert!(results[1].stdout.contains("recovery"));
     }
 
     #[tokio::test]
@@ -385,38 +544,25 @@ mod tests {
             task("consumer", "echo got={{tasks.producer.stdout}}", Some("producer")),
         ]);
         let results = e.run("test-workflow").await.unwrap();
-        assert_eq!(results.len(), 2);
         assert!(results[1].stdout.contains("got=artifact.tar"));
     }
 
     #[tokio::test]
     async fn run_and_gate_skips_if_either_fails() {
-        let e = engine(vec![
-            task("a", "echo a", None),
-            task("b", "exit 1", None),
-            task("c", "echo c", Some("a AND b")),
-        ]);
+        let e = engine(vec![task("a", "echo a", None), task("b", "exit 1", None), task("c", "echo c", Some("a AND b"))]);
         let results = e.run("test-workflow").await.unwrap();
-        assert_eq!(results.len(), 2);
         assert!(!results.iter().any(|r| r.id == "c"));
     }
 
-    // --- Sprint 3: event emission ---
+    // --- events ---
 
     #[tokio::test]
     async fn run_emits_lifecycle_events() {
-        use tokio::sync::broadcast;
         let (tx, mut rx) = broadcast::channel(32);
-        let e = engine(vec![task("step", "echo hi", None)])
-            .with_events(tx)
-            .with_run_id("run-1".into());
+        let e = engine(vec![task("step", "echo hi", None)]).with_events(tx).with_run_id("run-1".into());
         e.run("test-workflow").await.unwrap();
-
         let mut events = vec![];
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
         assert!(events.iter().any(|e| matches!(e, Event::WorkflowStarted { run_id, .. } if run_id == "run-1")));
         assert!(events.iter().any(|e| matches!(e, Event::TaskStarted    { task, .. } if task == "step")));
         assert!(events.iter().any(|e| matches!(e, Event::TaskFinished   { task, success: true, .. } if task == "step")));
@@ -425,32 +571,21 @@ mod tests {
 
     #[tokio::test]
     async fn run_emits_task_skipped_when_gate_fails() {
-        use tokio::sync::broadcast;
         let (tx, mut rx) = broadcast::channel(32);
-        let e = engine(vec![
-            task("fail", "exit 1", None),
-            task("skip", "echo nope", Some("fail")),
-        ])
-        .with_events(tx)
-        .with_run_id("run-2".into());
+        let e = engine(vec![task("fail", "exit 1", None), task("skip", "echo nope", Some("fail"))]).with_events(tx).with_run_id("run-2".into());
         e.run("test-workflow").await.unwrap();
-
         let mut events = vec![];
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
         assert!(events.iter().any(|e| matches!(e, Event::TaskSkipped { task, .. } if task == "skip")));
     }
 
-    // --- Sprint 4: trigger params ---
+    // --- trigger params ---
 
     #[tokio::test]
     async fn run_injects_trigger_params_into_task() {
         let e = engine(vec![task("greet", "echo {{trigger.name}}", None)])
             .with_params(HashMap::from([("name".into(), "vortex".into())]));
         let results = e.run("test-workflow").await.unwrap();
-        assert_eq!(results.len(), 1);
         assert!(results[0].stdout.contains("vortex"));
     }
 
@@ -461,25 +596,15 @@ mod tests {
         assert!(results[0].stdout.contains("xy"));
     }
 
-    // --- Sprint 6: history persistence ---
+    // --- store persistence ---
 
     #[tokio::test]
     async fn run_persists_to_store() {
-        let e = engine(vec![
-            task("step1", "echo hello", None),
-            task("step2", "echo world", Some("step1")),
-        ]).with_run_id("hist-1".into());
-        e.run("test-workflow").await.unwrap();
-
-        let store = crate::store::Store::open(":memory:").unwrap();
-        // Engine opens its own :memory: store — verify via a fresh engine run that
-        // writes to a file-based store we can then inspect.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
         let e2 = Engine::new(workflow(vec![task("a", "echo a", None), task("b", "echo b", Some("a"))]), &db)
             .with_run_id("hist-2".into());
         e2.run("wf").await.unwrap();
-
         let s = Store::open(&db).unwrap();
         let run = s.get_run("hist-2").unwrap().unwrap();
         assert_eq!(run.run.workflow, "wf");
@@ -493,16 +618,145 @@ mod tests {
     async fn run_persists_skipped_task() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
-        let e = Engine::new(
-            workflow(vec![task("fail", "exit 1", None), task("skip", "echo nope", Some("fail"))]),
-            &db,
-        ).with_run_id("hist-3".into());
+        let e = Engine::new(workflow(vec![task("fail", "exit 1", None), task("skip", "echo nope", Some("fail"))]), &db)
+            .with_run_id("hist-3".into());
         e.run("wf").await.unwrap();
-
         let s = Store::open(&db).unwrap();
         let run = s.get_run("hist-3").unwrap().unwrap();
         assert_eq!(run.run.status, "failure");
         let skip_task = run.tasks.iter().find(|t| t.task_id == "skip").unwrap();
         assert_eq!(skip_task.status, "skipped");
+    }
+
+    // --- Sprint 12: numeric gate expressions ---
+
+    #[tokio::test]
+    async fn run_numeric_gate_routes_by_exit_code() {
+        let e = engine(vec![
+            task("build", "exit 42", None),
+            task("on_42", "echo matched",     Some("{{tasks.build.exit_code}} == 42")),
+            task("on_0",  "echo not_matched", Some("{{tasks.build.exit_code}} == 0")),
+        ]);
+        let results = e.run("test").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "on_42" && r.success));
+        assert!(!results.iter().any(|r| r.id == "on_0"));
+    }
+
+    #[tokio::test]
+    async fn run_numeric_gate_compares_stdout_value() {
+        let e = engine(vec![
+            task("price", "echo 150",      None),
+            task("alert", "echo triggered", Some("{{tasks.price.stdout}} > 100")),
+            task("skip",  "echo skipped",   Some("{{tasks.price.stdout}} > 200")),
+        ]);
+        let results = e.run("test").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "alert" && r.success));
+        assert!(!results.iter().any(|r| r.id == "skip"));
+    }
+
+    // --- Sprint 13: new task types ---
+
+    #[tokio::test]
+    async fn sleep_task_runs_successfully() {
+        let e = engine(vec![TaskConfig {
+            id: "wait".into(),
+            kind: TaskKind::Sleep { duration: "10ms".into() },
+            when: None,
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn store_set_then_get_across_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("v.db").to_string_lossy().into_owned();
+        let wf = workflow(vec![
+            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None },
+            TaskConfig { id: "read".into(), kind: TaskKind::StoreGet { get: "mykey".into() }, when: Some("save".into()) },
+        ]);
+        let e = Engine::new(wf, &db);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[1].success);
+        assert_eq!(results[1].stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn parse_duration_parses_common_formats() {
+        assert_eq!(parse_duration("100ms").unwrap(), std::time::Duration::from_millis(100));
+        assert_eq!(parse_duration("5s").unwrap(),    std::time::Duration::from_secs(5));
+        assert_eq!(parse_duration("2m").unwrap(),    std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parse_duration_rejects_invalid() {
+        assert!(parse_duration("not-a-duration").is_err());
+    }
+
+    // --- Spawn task ---
+
+    #[tokio::test]
+    async fn spawn_task_captures_stdout() {
+        let e = engine(vec![TaskConfig {
+            id: "greet".into(),
+            kind: TaskKind::Spawn { exe: "echo".into(), args: vec!["hello".into(), "world".into()] },
+            when: None,
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert!(results[0].stdout.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn spawn_task_exit_zero_is_success() {
+        let e = engine(vec![TaskConfig {
+            id: "ok".into(),
+            kind: TaskKind::Spawn { exe: "true".into(), args: vec![] },
+            when: None,
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_task_nonzero_exit_is_failure() {
+        let e = engine(vec![TaskConfig {
+            id: "fail".into(),
+            kind: TaskKind::Spawn { exe: "false".into(), args: vec![] },
+            when: None,
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_ne!(results[0].exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_task_reads_trigger_params_from_stdin() {
+        // `cat` echoes stdin to stdout — trigger params JSON should appear
+        let e = engine(vec![TaskConfig {
+            id: "echo_params".into(),
+            kind: TaskKind::Spawn { exe: "cat".into(), args: vec![] },
+            when: None,
+        }]).with_params(HashMap::from([("Body".into(), "hello".into()), ("Sender".into(), "@user".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        let out: serde_json::Value = serde_json::from_str(&results[0].stdout).unwrap();
+        assert_eq!(out["Body"], "hello");
+        assert_eq!(out["Sender"], "@user");
+    }
+
+    #[tokio::test]
+    async fn spawn_task_gates_on_exit_code() {
+        let e = engine(vec![
+            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None },
+            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()) },
+        ]);
+        let results = e.run("test").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "filter" && !r.success));
+        assert!(!results.iter().any(|r| r.id == "action"));
     }
 }

@@ -61,7 +61,8 @@ struct WorkflowConfigDto {
 #[derive(Serialize)]
 struct TaskConfigDto {
     id: String,
-    exec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exec: Option<String>,
     when: Option<String>,
 }
 
@@ -279,7 +280,7 @@ async fn get_workflow_config(
                 name: name.clone(),
                 tasks: wf.tasks.iter().map(|t| TaskConfigDto {
                     id: t.id.clone(),
-                    exec: t.exec.clone(),
+                    exec: if let crate::config::TaskKind::Shell { exec } = &t.kind { Some(exec.clone()) } else { None },
                     when: t.when.clone(),
                 }).collect(),
             };
@@ -413,13 +414,16 @@ mod tests {
                     crate::config::WorkflowConfig {
                         tasks: vec![crate::config::TaskConfig {
                             id: "step".into(),
-                            exec: "echo hi".into(),
+                            kind: crate::config::TaskKind::Shell { exec: "echo hi".into() },
                             when: None,
                         }],
+                        cron: None,
                     },
                 );
                 m
             },
+            inputs: Default::default(),
+            email: None,
         };
         AppState { config: Arc::new(config), event_tx: tx, auth_token: "secret".into() }
     }
@@ -671,11 +675,14 @@ mod tests {
                 let mut m = std::collections::HashMap::new();
                 m.insert("wf".into(), crate::config::WorkflowConfig {
                     tasks: vec![crate::config::TaskConfig {
-                        id: "step".into(), exec: "echo hi".into(), when: None,
+                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: "echo hi".into() }, when: None,
                     }],
+                    cron: None,
                 });
                 m
             },
+            inputs: Default::default(),
+            email: None,
         };
         AppState { config: Arc::new(config), event_tx: tx, auth_token: "secret".into() }
     }
@@ -826,11 +833,14 @@ mod tests {
                 let mut m = std::collections::HashMap::new();
                 m.insert(id.into(), crate::config::WorkflowConfig {
                     tasks: vec![crate::config::TaskConfig {
-                        id: "step".into(), exec: exec.into(), when: None,
+                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: exec.into() }, when: None,
                     }],
+                    cron: None,
                 });
                 m
             },
+            inputs: Default::default(),
+            email: None,
         };
         AppState { config: Arc::new(config), event_tx: tx, auth_token: "secret".into() }
     }

@@ -171,9 +171,10 @@ mod tests {
             WorkflowConfig {
                 tasks: vec![TaskConfig {
                     id: "say".into(),
-                    exec: "echo hello={{trigger.name}}".into(),
+                    kind: crate::config::TaskKind::Shell { exec: "echo hello={{trigger.name}}".into() },
                     when: None,
                 }],
+                cron: None,
             },
         );
         Arc::new(Config {
@@ -183,6 +184,8 @@ mod tests {
                 db_path: test_db_path(),
             },
             workflows,
+            inputs: Default::default(),
+            email: None,
         })
     }
 
@@ -243,9 +246,10 @@ mod tests {
         workflows.insert("output-wf".into(), crate::config::WorkflowConfig {
             tasks: vec![crate::config::TaskConfig {
                 id: "step".into(),
-                exec: r#"printf '{"hello":"world"}'"#.into(),
+                kind: crate::config::TaskKind::Shell { exec: r#"printf '{"hello":"world"}'"#.into() },
                 when: None,
             }],
+            cron: None,
         });
         let config = std::sync::Arc::new(crate::config::Config {
             server: crate::config::ServerConfig {
@@ -254,6 +258,8 @@ mod tests {
                 db_path: test_db_path(),
             },
             workflows,
+            inputs: Default::default(),
+            email: None,
         });
         tokio::spawn(serve(config, tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
