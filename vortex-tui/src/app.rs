@@ -480,8 +480,8 @@ mod tests {
         DependencyGraph::from_config(WorkflowConfigDto {
             name: workflow.into(),
             tasks: vec![
-                TaskConfigDto { id: "a".into(), exec: "echo".into(), when: None },
-                TaskConfigDto { id: "b".into(), exec: "echo".into(), when: Some("a".into()) },
+                TaskConfigDto { id: "a".into(), exec: None, when: None },
+                TaskConfigDto { id: "b".into(), exec: None, when: Some("a".into()) },
             ],
         })
     }

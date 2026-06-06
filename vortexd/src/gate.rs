@@ -62,6 +62,9 @@ mod tests {
                 stderr: String::new(),
                 exit_code: if success { 0 } else { 1 },
                 success,
+                output: None,
+                status: None,
+                response: None,
             },
         )
     }

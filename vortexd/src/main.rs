@@ -4,6 +4,8 @@ mod engine;
 mod event;
 mod gate;
 mod listener;
+mod ntfy;
+mod scheduler;
 mod server;
 mod store;
 mod template;
@@ -28,6 +30,14 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(config);
     let (event_tx, _) = broadcast::channel::<event::Event>(256);
+
+    scheduler::run(Arc::clone(&config), event_tx.clone()).await;
+
+    for ntfy_cfg in config.inputs.ntfy.clone() {
+        let cfg = Arc::clone(&config);
+        let tx  = event_tx.clone();
+        tokio::spawn(async move { ntfy::listen(ntfy_cfg, cfg, tx).await });
+    }
 
     let uds_handle = {
         let cfg = Arc::clone(&config);

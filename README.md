@@ -79,26 +79,49 @@ history_limit = 25
 # history_limit = 10
 
 [workflows.process-message]
+# correlation_id is a template expression evaluated against trigger params.
+# Fallback chain: trigger.correlation_id → trigger.id → UUID.
+correlation_id = "{{trigger.id}}"
+
 tasks = [
-  { id = "check_spam",     exec = "check_spam.sh '{{trigger.msg}}'" },
-  { id = "check_voice",    exec = "is_voice.sh '{{trigger.type}}'",  when = "NOT check_spam" },
-  { id = "stt",            exec = "stt.sh '{{trigger.audio}}'",      when = "check_voice" },
-  { id = "send_voice",     exec = "send.sh '{{tasks.stt.stdout}}'",  when = "stt" },
-  { id = "check_group",    exec = "is_group.sh '{{trigger.group}}'", when = "NOT check_spam" },
-  { id = "translate",      exec = "translate.sh '{{trigger.msg}}'",  when = "check_group" },
-  { id = "send_translated",exec = "send.sh '{{tasks.translate.stdout}}'", when = "translate" },
+  { id = "check_spam",  type = "spawn",  exe = "spam-filter", args = ["--json"] },
+  { id = "check_voice", type = "shell",  exec = "is_voice.sh '{{trigger.type}}'",   when = "NOT check_spam" },
+  { id = "stt",         type = "shell",  exec = "stt.sh '{{trigger.audio}}'",        when = "check_voice" },
+  { id = "send_voice",  type = "shell",  exec = "send.sh '{{tasks.stt.stdout}}'",    when = "stt" },
+  { id = "check_group", type = "shell",  exec = "is_group.sh '{{trigger.group}}'",   when = "NOT check_spam" },
+  { id = "translate",   type = "shell",  exec = "translate.sh '{{trigger.msg}}'",    when = "check_group" },
+  # response task: renders template directly, no subprocess.
+  # Its output becomes the synchronous response body.
+  { id = "reply",       type = "response",
+    template = '{"id":"{{correlation_id}}","status":"ok","text":{{json tasks.translate.stdout}}}',
+    when = "translate" },
 ]
 ```
+
+### Task types
+
+Every task requires a `type` field:
+
+| `type` | Required fields | Description |
+|---|---|---|
+| `shell` | `exec` | Shell command string; templated, stdout captured |
+| `spawn` | `exe`, `args` | Binary + args array (no shell); trigger params JSON piped to stdin |
+| `response` | `template` | Renders template, no subprocess; output becomes workflow response |
+| `notify` | `topic`, `message` | Push via ntfy; optional `title`, `priority`, `tags`, `server`, `token` |
+| `http` | `url` | HTTP request; optional `method`, `headers`, `body` |
+
+Any task (including `shell`/`spawn`) can also carry `response_template` — a template rendered after the task succeeds, which becomes the workflow response. If more than one task produces a response, a warning is logged and the last one wins.
 
 ### Terminology
 
 | Term | Meaning |
 |---|---|
-| **Trigger** | The incoming event that starts a workflow (HTTP POST or UDS message) |
+| **Trigger** | The incoming event that starts a workflow (UDS message or HTTP POST) |
 | **Workflow** | A named pipeline — a list of tasks in `vortex.toml` |
-| **Task** | An atomic shell command within a workflow |
+| **Task** | An atomic unit of work within a workflow |
 | **Gate** | A boolean `when` expression controlling whether a task runs |
 | **Run** | A single workflow execution, identified by `run_id` |
+| **Correlation ID** | A caller-provided ID threaded through the run; available as `{{correlation_id}}` |
 
 ### Gate expressions
 
@@ -113,11 +136,12 @@ tasks = [
 
 ### Template variables
 
-Task `exec` strings support `{{…}}` substitution:
+`exec`, `response`, and template fields support `{{…}}` substitution (Handlebars):
 
 | Variable | Value |
 |---|---|
 | `{{trigger.<key>}}` | Parameter from the trigger payload |
+| `{{correlation_id}}` | Correlation ID for this run (see `correlation_id` on workflow) |
 | `{{tasks.<id>.stdout}}` | Captured stdout of a completed task |
 | `{{tasks.<id>.stderr}}` | Captured stderr |
 | `{{tasks.<id>.success}}` | `true` / `false` |
@@ -126,6 +150,12 @@ Task `exec` strings support `{{…}}` substitution:
 | `{{globals.<key>}}` | Value from the SQLite global store |
 
 Missing keys render as empty string (non-strict mode).
+
+**Helpers:**
+
+| Helper | Example | Output |
+|---|---|---|
+| `{{json value}}` | `{{json trigger.name}}` | `"Alice"` — JSON-serializes the value with quotes and escaping |
 
 ### Secret providers
 
@@ -175,10 +205,12 @@ HTTP response (202 Accepted):
 {"run_id": "550e8400-…", "workflow": "matrix-message-handle"}
 ```
 
-UDS response:
+UDS response — the rendered output of the last `response` task or `response_template` that succeeded:
 ```json
-{"status": "ok", "run_id": "550e8400-…", "tasks_run": 3, "output": "…last task stdout…"}
+{"id": "mx-proxy-a3f2…", "status": "ok", "text": "hello"}
 ```
+
+If no response task is configured, returns `{"id": "<correlation_id>"}`. If the workflow errors before any response is produced, returns `{"id": "…", "status": "error", "message": "…"}`.
 
 ## REST API
 
@@ -267,6 +299,7 @@ The DAG modal shows tasks in depth order (roots first), with their `when` expres
 | 8 — Multi-source TUI | ✅ Done | `[[tui.sources]]` config, tab bar with connection indicators, `Tab`/`Shift+Tab` switching, per-source WS reconnect |
 | 9 — Processor endpoint | ✅ Done | `POST /process/{workflow}` synchronous endpoint; `VORTEX_TRIGGER_PARAMS` env var; homelab deployment |
 | 10 — API cleanup | ✅ Done | `POST /trigger/{workflow}` (workflow in path); `/process` → `/execute`; UDS response includes `output`; `matrix-message-handle` workflow rename |
+| 11 — Explicit types + response protocol | ✅ Done | `type =` required on all tasks; `Response` task kind; `response_template` field; `correlation_id` on workflow; `{{json}}` helper; flat JSON UDS response |
 
 ## License
 

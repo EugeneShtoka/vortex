@@ -38,6 +38,10 @@ pub struct WorkflowConfig {
     pub tasks: Vec<TaskConfig>,
     #[serde(default)]
     pub cron: Option<String>,
+    /// Handlebars template evaluated against trigger params to determine the
+    /// correlation ID included in the response. Falls back to trigger.correlation_id
+    /// → trigger.id → UUID if omitted or if the rendered value is empty.
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,12 +50,16 @@ pub struct TaskConfig {
     #[serde(flatten)]
     pub kind: TaskKind,
     pub when: Option<String>,
+    /// Handlebars template rendered after the task succeeds. The rendered string
+    /// becomes the workflow response instead of raw stdout. Has access to all prior
+    /// task results (including this task's own stdout via `{{tasks.<id>.stdout}}`),
+    /// trigger params, globals, env vars, and `{{correlation_id}}`.
+    pub response_template: Option<String>,
 }
 
-/// Task type dispatched by the engine. Untagged: serde matches on field presence.
-/// Ordering matters — more specific variants (more required fields) first.
+/// Task type dispatched by the engine. Tagged: `type = "shell"` etc. in TOML.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskKind {
     Shell   { exec: String },
     Http    { url: String, #[serde(default = "default_method")] method: String, #[serde(default)] headers: HashMap<String, String>, body: Option<String> },
@@ -65,6 +73,11 @@ pub enum TaskKind {
     /// VORTEX_TRIGGER_PARAMS. Each element of `args` is passed as a separate argv entry —
     /// no quoting or escaping needed.
     Spawn   { exe: String, #[serde(default)] args: Vec<String> },
+    /// Renders a Handlebars template and returns the result as the workflow response.
+    /// No subprocess is spawned. Has access to all prior task results, trigger params,
+    /// globals, env vars, and `{{correlation_id}}`. Use as the last task in a workflow
+    /// to explicitly shape the reply to the caller.
+    Response { template: String },
 }
 
 fn default_method() -> String {
@@ -126,9 +139,9 @@ auth_key = "VORTEX_TOKEN"
 
 [workflows.deploy]
 tasks = [
-  { id = "pull_code", exec = "git pull" },
-  { id = "build",       exec = "cargo build", when = "pull_code" },
-  { id = "notify_fail", exec = "echo failed",  when = "NOT build" },
+  { id = "pull_code",   type = "shell", exec = "git pull" },
+  { id = "build",       type = "shell", exec = "cargo build", when = "pull_code" },
+  { id = "notify_fail", type = "shell", exec = "echo failed",  when = "NOT build" },
 ]
 "#;
 
@@ -205,14 +218,12 @@ unix_socket = "/tmp/v.sock"
 
 [workflows.sync-and-build]
 tasks = [
-  { id = "pull", exec = "git pull" },
+  { id = "pull", type = "shell", exec = "git pull" },
 ]
 "#;
         let cfg = parse_config(toml).unwrap();
         assert!(cfg.workflows.contains_key("sync-and-build"));
     }
-
-    // --- Sprint 13: task types ---
 
     const TASK_TYPES_SAMPLE: &str = r#"
 [server]
@@ -220,13 +231,13 @@ unix_socket = "/tmp/v.sock"
 
 [workflows.test]
 tasks = [
-  { id = "shell_task",  exec = "echo hi" },
-  { id = "http_task",   url = "https://example.com/api", method = "POST", body = "{}" },
-  { id = "sleep_task",  duration = "100ms" },
-  { id = "notify_task", topic = "alerts", message = "done" },
-  { id = "email_task",  to = "a@b.com", subject = "Hi", body = "body" },
-  { id = "store_set",   set = { version = "1.0" } },
-  { id = "store_get",   get = "version" },
+  { id = "shell_task",  type = "shell",     exec = "echo hi" },
+  { id = "http_task",   type = "http",      url = "https://example.com/api", method = "POST", body = "{}" },
+  { id = "sleep_task",  type = "sleep",     duration = "100ms" },
+  { id = "notify_task", type = "notify",    topic = "alerts", message = "done" },
+  { id = "email_task",  type = "email",     to = "a@b.com", subject = "Hi", body = "body" },
+  { id = "store_set",   type = "store_set", set = { version = "1.0" } },
+  { id = "store_get",   type = "store_get", get = "version" },
 ]
 "#;
 
@@ -250,7 +261,7 @@ tasks = [
 [server]
 unix_socket = "/tmp/v.sock"
 [workflows.w]
-tasks = [{ id = "t", url = "https://example.com" }]
+tasks = [{ id = "t", type = "http", url = "https://example.com" }]
 "#;
         let cfg = parse_config(toml).unwrap();
         if let TaskKind::Http { method, .. } = &cfg.workflows["w"].tasks[0].kind {
@@ -303,7 +314,7 @@ unix_socket = "/tmp/v.sock"
 
 [workflows.backup]
 cron  = "0 2 * * *"
-tasks = [{ id = "run", exec = "backup.sh" }]
+tasks = [{ id = "run", type = "shell", exec = "backup.sh" }]
 "#;
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.workflows["backup"].cron.as_deref(), Some("0 2 * * *"));
@@ -323,7 +334,7 @@ unix_socket = "/tmp/v.sock"
 
 [workflows.w]
 tasks = [
-  { id = "filter", exe = "jx-match", args = ["-e", "Sender contains \"@whatsapp\""] },
+  { id = "filter", type = "spawn", exe = "jx-match", args = ["-e", "Sender contains \"@whatsapp\""] },
 ]
 "#;
         let cfg = parse_config(toml).unwrap();
@@ -344,7 +355,7 @@ tasks = [
 unix_socket = "/tmp/v.sock"
 
 [workflows.w]
-tasks = [{ id = "t", exe = "true" }]
+tasks = [{ id = "t", type = "spawn", exe = "true" }]
 "#;
         let cfg = parse_config(toml).unwrap();
         if let TaskKind::Spawn { exe, args } = &cfg.workflows["w"].tasks[0].kind {
@@ -353,5 +364,58 @@ tasks = [{ id = "t", exe = "true" }]
         } else {
             panic!("expected Spawn kind");
         }
+    }
+
+    #[test]
+    fn parses_response_task() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[workflows.w]
+tasks = [{ id = "reply", type = "response", template = "{{json trigger.text}}" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        let task = &cfg.workflows["w"].tasks[0];
+        assert_eq!(task.id, "reply");
+        if let TaskKind::Response { template } = &task.kind {
+            assert_eq!(template, "{{json trigger.text}}");
+        } else {
+            panic!("expected Response kind");
+        }
+    }
+
+    #[test]
+    fn parses_response_template_field_on_task() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[workflows.w]
+tasks = [{ id = "check", type = "spawn", exe = "spam.sh", response_template = "{\"status\":\"drop\"}" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        let task = &cfg.workflows["w"].tasks[0];
+        assert_eq!(task.response_template.as_deref(), Some("{\"status\":\"drop\"}"));
+    }
+
+    #[test]
+    fn parses_correlation_id_on_workflow() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[workflows.w]
+correlation_id = "{{trigger.event_id}}"
+tasks = [{ id = "t", type = "shell", exec = "true" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.workflows["w"].correlation_id.as_deref(), Some("{{trigger.event_id}}"));
+    }
+
+    #[test]
+    fn correlation_id_is_optional() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert!(cfg.workflows["deploy"].correlation_id.is_none());
     }
 }

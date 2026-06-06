@@ -9,7 +9,8 @@ pub struct WorkflowConfigDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskConfigDto {
     pub id: String,
-    pub exec: String,
+    #[serde(default)]
+    pub exec: Option<String>,
     pub when: Option<String>,
 }
 
@@ -105,7 +106,7 @@ mod tests {
             name: name.into(),
             tasks: tasks.iter().map(|(id, when)| TaskConfigDto {
                 id: id.to_string(),
-                exec: "echo".into(),
+                exec: None,
                 when: when.map(str::to_string),
             }).collect(),
         }

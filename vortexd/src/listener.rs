@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -11,6 +12,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::engine::{Engine, TaskResult};
 use crate::event::Event;
+use crate::template;
 
 #[derive(Debug, Deserialize)]
 struct TriggerRequest {
@@ -18,14 +20,6 @@ struct TriggerRequest {
     #[serde(default)]
     params: HashMap<String, String>,
     id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum Response {
-    Ok { id: Option<String>, run_id: String, tasks_run: usize, output: Option<serde_json::Value> },
-    Error { id: Option<String>, message: String },
-    UnknownWorkflow { id: Option<String>, workflow: String },
 }
 
 pub async fn serve(config: Arc<Config>, event_tx: broadcast::Sender<Event>) -> Result<()> {
@@ -65,7 +59,7 @@ async fn handle_connection(
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
-            break; // client disconnected
+            break;
         }
         let line = line.trim();
         if line.is_empty() {
@@ -75,7 +69,7 @@ async fn handle_connection(
         let response = match serde_json::from_str::<TriggerRequest>(line) {
             Err(e) => {
                 warn!("Malformed request: {e}");
-                Response::Error { id: None, message: format!("Invalid JSON: {e}") }
+                json!({ "status": "error", "message": format!("Invalid JSON: {e}") })
             }
             Ok(req) => handle_request(req, &config, &event_tx).await,
         };
@@ -92,31 +86,39 @@ async fn handle_request(
     req: TriggerRequest,
     config: &Arc<Config>,
     event_tx: &broadcast::Sender<Event>,
-) -> Response {
-    let id = req.id.clone();
+) -> serde_json::Value {
     let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Inject top-level request `id` into params so correlation_id templates and
+    // fallback chain can reference it as `{{trigger.id}}` / `params.get("id")`.
+    let mut params = req.params;
+    if let Some(ref rid) = req.id {
+        params.entry("id".into()).or_insert_with(|| rid.clone());
+    }
 
     info!(workflow = %req.workflow, "Trigger received on UDS");
     event_tx.send(Event::TriggerReceived {
         run_id: run_id.clone(),
         workflow: req.workflow.clone(),
-        params: req.params.clone(),
+        params: params.clone(),
     }).ok();
 
     let Some(workflow_config) = config.workflows.get(&req.workflow) else {
         warn!(workflow = %req.workflow, "Unknown workflow");
         event_tx.send(Event::TriggerRejected { run_id, reason: "unknown_workflow".into() }).ok();
-        return Response::UnknownWorkflow { id, workflow: req.workflow };
+        let cid = correlation_id_fallback(&params);
+        return json!({ "id": cid, "status": "error", "message": format!("unknown workflow: {}", req.workflow) });
     };
 
-    // UDS is secured by filesystem permissions — no bearer auth needed
+    let correlation_id = compute_correlation_id(workflow_config, &params);
+
     event_tx.send(Event::TriggerAccepted {
         run_id: run_id.clone(),
         workflow: req.workflow.clone(),
-        params: req.params.clone(),
+        params: params.clone(),
     }).ok();
 
-    execute_workflow(&req.workflow, workflow_config.clone(), req.params, &config.server.db_path, run_id, id, event_tx).await
+    execute_workflow(&req.workflow, workflow_config.clone(), params, &config.server.db_path, run_id, correlation_id, event_tx).await
 }
 
 async fn execute_workflow(
@@ -125,35 +127,81 @@ async fn execute_workflow(
     params: HashMap<String, String>,
     db_path: &str,
     run_id: String,
-    id: Option<String>,
+    correlation_id: String,
     event_tx: &broadcast::Sender<Event>,
-) -> Response {
+) -> serde_json::Value {
     let engine = Engine::new(workflow_config, db_path)
         .with_events(event_tx.clone())
-        .with_run_id(run_id.clone())
-        .with_params(params);
+        .with_run_id(run_id)
+        .with_params(params)
+        .with_correlation_id(correlation_id.clone());
 
     match engine.run(workflow).await {
-        Ok(results) => Response::Ok { id, run_id, tasks_run: results.len(), output: last_output(&results) },
-        Err(e) => Response::Error { id, message: format!("{e:#}") },
+        Ok(results) => {
+            match workflow_response(&results) {
+                Some(mut val) => {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.entry("id").or_insert_with(|| json!(correlation_id));
+                    }
+                    val
+                }
+                None => json!({ "id": correlation_id }),
+            }
+        }
+        Err(e) => {
+            error!(workflow = workflow, "Workflow execution error: {e:#}");
+            json!({ "id": correlation_id, "status": "error", "message": e.to_string() })
+        }
     }
 }
 
-fn last_output(results: &[TaskResult]) -> Option<serde_json::Value> {
+/// Returns the rendered response from the last successful task that has either
+/// a `response_template` (rendered into `result.response`) or is a `Response`
+/// task kind (stdout = rendered template). Returns None if no task produced a
+/// response — callers fall through to their default behavior.
+fn workflow_response(results: &[TaskResult]) -> Option<serde_json::Value> {
     results.iter()
-        .filter(|r| r.success)
+        .filter(|r| r.success && r.response.is_some())
         .last()
-        .map(|r| {
-            let trimmed = r.stdout.trim();
-            serde_json::from_str(trimmed)
-                .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
+        .and_then(|r| {
+            let s = r.response.as_deref()?;
+            serde_json::from_str(s.trim()).ok()
         })
+}
+
+/// Computes the correlation ID for a workflow run:
+/// 1. Render `workflow_config.correlation_id` template if set
+/// 2. Else fall back via `correlation_id_fallback`
+fn compute_correlation_id(
+    wf: &crate::config::WorkflowConfig,
+    params: &HashMap<String, String>,
+) -> String {
+    if let Some(tmpl) = &wf.correlation_id {
+        if let Ok(rendered) = template::render(tmpl, &HashMap::new(), &HashMap::new(), params, "") {
+            let trimmed = rendered.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    correlation_id_fallback(params)
+}
+
+/// Fallback chain: trigger.correlation_id → trigger.id → UUID
+fn correlation_id_fallback(params: &HashMap<String, String>) -> String {
+    if let Some(v) = params.get("correlation_id").filter(|v| !v.is_empty()) {
+        return v.clone();
+    }
+    if let Some(v) = params.get("id").filter(|v| !v.is_empty()) {
+        return v.clone();
+    }
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ServerConfig, TaskConfig, WorkflowConfig};
+    use crate::config::{ServerConfig, TaskConfig, TaskKind, WorkflowConfig};
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
@@ -171,10 +219,12 @@ mod tests {
             WorkflowConfig {
                 tasks: vec![TaskConfig {
                     id: "say".into(),
-                    kind: crate::config::TaskKind::Shell { exec: "echo hello={{trigger.name}}".into() },
+                    kind: TaskKind::Shell { exec: "echo hello={{trigger.name}}".into() },
                     when: None,
+                    response_template: None,
                 }],
                 cron: None,
+                correlation_id: None,
             },
         );
         Arc::new(Config {
@@ -199,10 +249,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uds_trigger_with_params_injects_into_task() {
+    async fn uds_trigger_with_params_runs_workflow() {
         let tmp = NamedTempFile::new().unwrap();
         let socket_path = tmp.path().to_str().unwrap().to_string();
-        drop(tmp); // release so listener can bind
+        drop(tmp);
 
         let (tx, _) = broadcast::channel(32);
         let config = make_config(&socket_path);
@@ -212,11 +262,12 @@ mod tests {
         let resp = send_and_recv(
             &socket_path,
             r#"{"workflow":"greet","params":{"name":"world"}}"#,
-        )
-        .await;
+        ).await;
 
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
+        // No response_template configured — response is just {"id":"..."}
+        assert!(v["id"].is_string());
+        assert!(v["status"].is_null()); // no status when no response template
     }
 
     #[tokio::test]
@@ -232,31 +283,29 @@ mod tests {
 
         let resp = send_and_recv(&socket_path, r#"{"workflow":"greet"}"#).await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
+        assert!(v["id"].is_string());
     }
 
     #[tokio::test]
-    async fn uds_response_includes_output() {
+    async fn uds_response_includes_response_template_output() {
         let tmp = NamedTempFile::new().unwrap();
         let socket_path = tmp.path().to_str().unwrap().to_string();
         drop(tmp);
 
         let (tx, _) = broadcast::channel(32);
         let mut workflows = std::collections::HashMap::new();
-        workflows.insert("output-wf".into(), crate::config::WorkflowConfig {
-            tasks: vec![crate::config::TaskConfig {
+        workflows.insert("output-wf".into(), WorkflowConfig {
+            tasks: vec![TaskConfig {
                 id: "step".into(),
-                kind: crate::config::TaskKind::Shell { exec: r#"printf '{"hello":"world"}'"#.into() },
+                kind: TaskKind::Shell { exec: r#"true"#.into() },
                 when: None,
+                response_template: Some(r#"{"id":"{{correlation_id}}","status":"ok","val":"hello"}"#.into()),
             }],
             cron: None,
+            correlation_id: None,
         });
-        let config = std::sync::Arc::new(crate::config::Config {
-            server: crate::config::ServerConfig {
-                unix_socket: socket_path.clone(),
-                network: None,
-                db_path: test_db_path(),
-            },
+        let config = Arc::new(Config {
+            server: ServerConfig { unix_socket: socket_path.clone(), network: None, db_path: test_db_path() },
             workflows,
             inputs: Default::default(),
             email: None,
@@ -264,14 +313,54 @@ mod tests {
         tokio::spawn(serve(config, tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let resp = send_and_recv(&socket_path, r#"{"workflow":"output-wf"}"#).await;
+        let resp = send_and_recv(&socket_path, r#"{"workflow":"output-wf","params":{"id":"req-1"}}"#).await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(v["status"], "ok");
-        assert_eq!(v["output"], serde_json::json!({"hello": "world"}));
+        assert_eq!(v["val"], "hello");
+        assert_eq!(v["id"], "req-1");
     }
 
     #[tokio::test]
-    async fn uds_response_echoes_id() {
+    async fn uds_response_task_produces_output() {
+        let tmp = NamedTempFile::new().unwrap();
+        let socket_path = tmp.path().to_str().unwrap().to_string();
+        drop(tmp);
+
+        let (tx, _) = broadcast::channel(32);
+        let mut workflows = std::collections::HashMap::new();
+        workflows.insert("reply-wf".into(), WorkflowConfig {
+            tasks: vec![TaskConfig {
+                id: "r".into(),
+                kind: TaskKind::Response {
+                    template: r#"{"id":"{{correlation_id}}","status":"ok","msg":"{{trigger.text}}"}"#.into(),
+                },
+                when: None,
+                response_template: None,
+            }],
+            cron: None,
+            correlation_id: None,
+        });
+        let config = Arc::new(Config {
+            server: ServerConfig { unix_socket: socket_path.clone(), network: None, db_path: test_db_path() },
+            workflows,
+            inputs: Default::default(),
+            email: None,
+        });
+        tokio::spawn(serve(config, tx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = send_and_recv(
+            &socket_path,
+            r#"{"workflow":"reply-wf","params":{"id":"req-7","text":"hi there"}}"#,
+        ).await;
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["msg"], "hi there");
+        assert_eq!(v["id"], "req-7");
+    }
+
+    #[tokio::test]
+    async fn uds_correlation_id_echoed_via_trigger_id_fallback() {
         let tmp = NamedTempFile::new().unwrap();
         let socket_path = tmp.path().to_str().unwrap().to_string();
         drop(tmp);
@@ -284,10 +373,8 @@ mod tests {
         let resp = send_and_recv(
             &socket_path,
             r#"{"workflow":"greet","params":{"name":"world"},"id":"req-42"}"#,
-        )
-        .await;
+        ).await;
         let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
         assert_eq!(v["id"], "req-42");
     }
 
@@ -311,13 +398,28 @@ mod tests {
 
         reader.read_line(&mut line).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
         assert_eq!(v["id"], "a");
 
         line.clear();
         reader.read_line(&mut line).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
         assert_eq!(v["id"], "b");
+    }
+
+    #[tokio::test]
+    async fn uds_unknown_workflow_returns_error_status() {
+        let tmp = NamedTempFile::new().unwrap();
+        let socket_path = tmp.path().to_str().unwrap().to_string();
+        drop(tmp);
+
+        let (tx, _) = broadcast::channel(32);
+        let config = make_config(&socket_path);
+        tokio::spawn(serve(config, tx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = send_and_recv(&socket_path, r#"{"workflow":"no-such-workflow","id":"x"}"#).await;
+        let v: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["id"], "x");
     }
 }

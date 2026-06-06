@@ -416,8 +416,10 @@ mod tests {
                             id: "step".into(),
                             kind: crate::config::TaskKind::Shell { exec: "echo hi".into() },
                             when: None,
+                            response_template: None,
                         }],
                         cron: None,
+                        correlation_id: None,
                     },
                 );
                 m
@@ -675,9 +677,10 @@ mod tests {
                 let mut m = std::collections::HashMap::new();
                 m.insert("wf".into(), crate::config::WorkflowConfig {
                     tasks: vec![crate::config::TaskConfig {
-                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: "echo hi".into() }, when: None,
+                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: "echo hi".into() }, when: None, response_template: None,
                     }],
                     cron: None,
+                    correlation_id: None,
                 });
                 m
             },
@@ -833,9 +836,10 @@ mod tests {
                 let mut m = std::collections::HashMap::new();
                 m.insert(id.into(), crate::config::WorkflowConfig {
                     tasks: vec![crate::config::TaskConfig {
-                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: exec.into() }, when: None,
+                        id: "step".into(), kind: crate::config::TaskKind::Shell { exec: exec.into() }, when: None, response_template: None,
                     }],
                     cron: None,
+                    correlation_id: None,
                 });
                 m
             },

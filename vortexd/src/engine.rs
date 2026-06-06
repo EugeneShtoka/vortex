@@ -25,6 +25,9 @@ pub struct TaskResult {
     pub success:   bool,
     pub output:    Option<serde_json::Value>,
     pub status:    Option<u16>,
+    /// Rendered response_template (or Response task output). When set on the last
+    /// successful task that has one, this becomes the workflow's response to the caller.
+    pub response:  Option<String>,
 }
 
 struct TaskOutcome {
@@ -39,21 +42,27 @@ struct TaskOutcome {
 // ── engine ────────────────────────────────────────────────────────────────────
 
 pub struct Engine {
-    config:       WorkflowConfig,
-    db_path:      String,
-    event_tx:     Option<broadcast::Sender<Event>>,
-    run_id:       Option<String>,
+    config:         WorkflowConfig,
+    db_path:        String,
+    event_tx:       Option<broadcast::Sender<Event>>,
+    run_id:         Option<String>,
     trigger_params: HashMap<String, String>,
-    email_config: Option<EmailConfig>,
+    email_config:   Option<EmailConfig>,
+    correlation_id: String,
 }
 
 impl Engine {
     pub fn new(config: WorkflowConfig, db_path: &str) -> Self {
-        Self { config, db_path: db_path.to_string(), event_tx: None, run_id: None, trigger_params: HashMap::new(), email_config: None }
+        Self { config, db_path: db_path.to_string(), event_tx: None, run_id: None, trigger_params: HashMap::new(), email_config: None, correlation_id: String::new() }
     }
 
     pub fn with_events(mut self, tx: broadcast::Sender<Event>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    pub fn with_correlation_id(mut self, id: String) -> Self {
+        self.correlation_id = id;
         self
     }
 
@@ -94,6 +103,16 @@ impl Engine {
         let mut results: HashMap<String, TaskResult> = HashMap::new();
         let mut all_results = Vec::new();
 
+        let mut response_task_count = 0usize;
+        for task in &ordered {
+            if task.response_template.is_some() || matches!(task.kind, TaskKind::Response { .. }) {
+                response_task_count += 1;
+            }
+        }
+        if response_task_count > 1 {
+            error!(workflow = workflow_name, count = response_task_count, "Multiple response tasks defined — only the last successful one will be used");
+        }
+
         for task in &ordered {
             if !self.gate_allows(task, &results, &all_ids, &globals)? {
                 warn!(task = %task.id, "Skipped (gate not met)");
@@ -103,7 +122,22 @@ impl Engine {
                 continue;
             }
 
-            let result = self.run_task(task, &run_id, &results, &globals).await?;
+            let mut result = self.run_task(task, &run_id, &results, &globals).await?;
+
+            if result.success {
+                if matches!(task.kind, TaskKind::Response { .. }) {
+                    // Response task: stdout IS the rendered template, promote to response
+                    result.response = Some(result.stdout.clone());
+                } else if let Some(tmpl) = &task.response_template {
+                    let mut rmap = results.clone();
+                    rmap.insert(result.id.clone(), result.clone());
+                    match template::render(tmpl, &rmap, &globals, &self.trigger_params, &self.correlation_id) {
+                        Ok(rendered) => result.response = Some(rendered),
+                        Err(e) => error!(task = %task.id, "response_template render error: {e:#}"),
+                    }
+                }
+            }
+
             results.insert(result.id.clone(), result.clone());
             all_results.push(result);
         }
@@ -154,7 +188,7 @@ impl Engine {
         });
 
         Ok(TaskResult { id: task.id.clone(), stdout: outcome.stdout, stderr: outcome.stderr,
-            exit_code: outcome.exit_code, success: outcome.success, output: outcome.output, status: outcome.status })
+            exit_code: outcome.exit_code, success: outcome.success, output: outcome.output, status: outcome.status, response: None })
     }
 
     async fn dispatch_task(
@@ -163,43 +197,51 @@ impl Engine {
         results: &HashMap<String, TaskResult>,
         globals: &HashMap<String, String>,
     ) -> Result<TaskOutcome> {
+        let cid = &self.correlation_id;
         match &task.kind {
             TaskKind::Shell { exec } => {
-                let cmd = template::render(exec, results, globals, &self.trigger_params)?;
+                let cmd = template::render(exec, results, globals, &self.trigger_params, cid)?;
                 execute_shell(&task.id, &cmd, &self.trigger_params).await
             }
             TaskKind::Http { url, method, headers, body } => {
-                let url  = template::render(url, results, globals, &self.trigger_params)?;
-                let body = body.as_ref().map(|b| template::render(b, results, globals, &self.trigger_params)).transpose()?;
-                let hdrs = render_map(headers, results, globals, &self.trigger_params)?;
+                let url  = template::render(url, results, globals, &self.trigger_params, cid)?;
+                let body = body.as_ref().map(|b| template::render(b, results, globals, &self.trigger_params, cid)).transpose()?;
+                let hdrs = render_map(headers, results, globals, &self.trigger_params, cid)?;
                 execute_http(method, &url, &hdrs, body.as_deref()).await
             }
             TaskKind::Notify { server, topic, message, title, priority, tags, token } => {
-                let msg   = template::render(message, results, globals, &self.trigger_params)?;
-                let title = title.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params)).transpose()?;
-                let tok   = token.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params)).transpose()?;
+                let msg   = template::render(message, results, globals, &self.trigger_params, cid)?;
+                let title = title.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params, cid)).transpose()?;
+                let tok   = token.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params, cid)).transpose()?;
                 let srv   = server.as_deref().unwrap_or("https://ntfy.sh");
                 execute_notify(srv, topic, &msg, title.as_deref(), priority.as_deref(), tags.as_deref(), tok.as_deref()).await
             }
             TaskKind::Email { to, subject, body, cc } => {
-                let subject = template::render(subject, results, globals, &self.trigger_params)?;
-                let body    = template::render(body, results, globals, &self.trigger_params)?;
+                let subject = template::render(subject, results, globals, &self.trigger_params, cid)?;
+                let body    = template::render(body, results, globals, &self.trigger_params, cid)?;
                 let cfg = self.email_config.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Email task requires [email] config section"))?;
                 execute_email(to, &subject, &body, cc.as_deref(), cfg).await
             }
             TaskKind::Sleep { duration } => execute_sleep(duration).await,
             TaskKind::StoreSet { set } => {
-                let rendered = render_map(set, results, globals, &self.trigger_params)?;
+                let rendered = render_map(set, results, globals, &self.trigger_params, cid)?;
                 execute_store_set(rendered, &self.db_path).await
             }
             TaskKind::StoreGet { get } => {
-                let key = template::render(get, results, globals, &self.trigger_params)?;
+                let key = template::render(get, results, globals, &self.trigger_params, cid)?;
                 execute_store_get(&key, &self.db_path).await
             }
             TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
             TaskKind::Spawn { exe, args } => {
                 execute_spawn(&task.id, exe, args, &self.trigger_params).await
+            }
+            TaskKind::Response { template } => {
+                let rendered = template::render(template, results, globals, &self.trigger_params, cid)?;
+                Ok(TaskOutcome {
+                    stdout: rendered, stderr: String::new(),
+                    exit_code: 0, success: true, output: None, status: None,
+                })
             }
         }
     }
@@ -212,7 +254,7 @@ impl Engine {
         globals: &HashMap<String, String>,
     ) -> Result<bool> {
         let Some(expr) = &task.when else { return Ok(true) };
-        let rendered = template::render(expr, results, globals, &self.trigger_params)?;
+        let rendered = template::render(expr, results, globals, &self.trigger_params, &self.correlation_id)?;
         gate::evaluate(&rendered, results, all_ids)
     }
 
@@ -379,8 +421,8 @@ async fn execute_store_get(key: &str, db_path: &str) -> Result<TaskOutcome> {
     Ok(TaskOutcome { stdout: value, stderr: String::new(), exit_code: 0, success: true, output, status: None })
 }
 
-fn render_map(map: &HashMap<String, String>, results: &HashMap<String, TaskResult>, globals: &HashMap<String, String>, params: &HashMap<String, String>) -> Result<HashMap<String, String>> {
-    map.iter().map(|(k, v)| template::render(v, results, globals, params).map(|r| (k.clone(), r))).collect()
+fn render_map(map: &HashMap<String, String>, results: &HashMap<String, TaskResult>, globals: &HashMap<String, String>, params: &HashMap<String, String>, cid: &str) -> Result<HashMap<String, String>> {
+    map.iter().map(|(k, v)| template::render(v, results, globals, params, cid).map(|r| (k.clone(), r))).collect()
 }
 
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
@@ -405,11 +447,11 @@ mod tests {
     use crate::event::Event;
 
     fn task(id: &str, exec: &str, when: Option<&str>) -> TaskConfig {
-        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string) }
+        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string), response_template: None }
     }
 
     fn workflow(tasks: Vec<TaskConfig>) -> WorkflowConfig {
-        WorkflowConfig { tasks, cron: None }
+        WorkflowConfig { tasks, cron: None, correlation_id: None }
     }
 
     fn engine(tasks: Vec<TaskConfig>) -> Engine {
@@ -418,7 +460,7 @@ mod tests {
     }
 
     fn tr(id: &str, success: bool) -> TaskResult {
-        TaskResult { id: id.into(), stdout: String::new(), stderr: String::new(), exit_code: if success { 0 } else { 1 }, success, output: None, status: None }
+        TaskResult { id: id.into(), stdout: String::new(), stderr: String::new(), exit_code: if success { 0 } else { 1 }, success, output: None, status: None, response: None }
     }
 
     // --- topological sort ---
@@ -661,7 +703,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "wait".into(),
             kind: TaskKind::Sleep { duration: "10ms".into() },
-            when: None,
+            when: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -673,8 +715,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
         let wf = workflow(vec![
-            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None },
-            TaskConfig { id: "read".into(), kind: TaskKind::StoreGet { get: "mykey".into() }, when: Some("save".into()) },
+            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, response_template: None },
+            TaskConfig { id: "read".into(), kind: TaskKind::StoreGet { get: "mykey".into() }, when: Some("save".into()), response_template: None },
         ]);
         let e = Engine::new(wf, &db);
         let results = e.run("test").await.unwrap();
@@ -702,7 +744,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "greet".into(),
             kind: TaskKind::Spawn { exe: "echo".into(), args: vec!["hello".into(), "world".into()] },
-            when: None,
+            when: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -715,7 +757,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "ok".into(),
             kind: TaskKind::Spawn { exe: "true".into(), args: vec![] },
-            when: None,
+            when: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -727,7 +769,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "fail".into(),
             kind: TaskKind::Spawn { exe: "false".into(), args: vec![] },
-            when: None,
+            when: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(!results[0].success);
@@ -740,7 +782,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "echo_params".into(),
             kind: TaskKind::Spawn { exe: "cat".into(), args: vec![] },
-            when: None,
+            when: None, response_template: None,
         }]).with_params(HashMap::from([("Body".into(), "hello".into()), ("Sender".into(), "@user".into())]));
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -752,11 +794,95 @@ mod tests {
     #[tokio::test]
     async fn spawn_task_gates_on_exit_code() {
         let e = engine(vec![
-            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None },
-            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()) },
+            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None, response_template: None },
+            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), response_template: None },
         ]);
         let results = e.run("test").await.unwrap();
         assert!(results.iter().any(|r| r.id == "filter" && !r.success));
         assert!(!results.iter().any(|r| r.id == "action"));
+    }
+
+    // --- Response task kind ---
+
+    #[tokio::test]
+    async fn response_task_renders_template() {
+        let e = engine(vec![
+            task("hello", "echo world", None),
+            TaskConfig {
+                id: "reply".into(),
+                kind: TaskKind::Response { template: "got={{tasks.hello.stdout}}".into() },
+                when: Some("hello".into()),
+                response_template: None,
+            },
+        ]);
+        let results = e.run("test").await.unwrap();
+        let r = results.iter().find(|r| r.id == "reply").unwrap();
+        assert!(r.success);
+        assert!(r.stdout.contains("got=world"));
+    }
+
+    #[tokio::test]
+    async fn response_task_uses_trigger_params() {
+        let e = engine(vec![TaskConfig {
+            id: "r".into(),
+            kind: TaskKind::Response { template: "msg={{trigger.text}}".into() },
+            when: None,
+            response_template: None,
+        }]).with_params(HashMap::from([("text".into(), "hello".into())]));
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results[0].stdout.trim(), "msg=hello");
+    }
+
+    #[tokio::test]
+    async fn response_task_uses_correlation_id() {
+        let e = engine(vec![TaskConfig {
+            id: "r".into(),
+            kind: TaskKind::Response { template: "id={{correlation_id}}".into() },
+            when: None,
+            response_template: None,
+        }]).with_correlation_id("req-99".into());
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results[0].stdout.trim(), "id=req-99");
+    }
+
+    // --- response_template field on task ---
+
+    #[tokio::test]
+    async fn response_template_rendered_after_task_succeeds() {
+        let e = engine(vec![TaskConfig {
+            id: "t".into(),
+            kind: TaskKind::Shell { exec: "echo raw".into() },
+            when: None,
+            response_template: Some("wrapped={{tasks.t.stdout}}".into()),
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert!(results[0].response.as_deref().unwrap_or("").contains("wrapped=raw"));
+    }
+
+    #[tokio::test]
+    async fn response_template_not_set_when_task_fails() {
+        let e = engine(vec![TaskConfig {
+            id: "t".into(),
+            kind: TaskKind::Shell { exec: "exit 1".into() },
+            when: None,
+            response_template: Some("should_not_appear".into()),
+        }]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert!(results[0].response.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_template_can_reference_own_stdout() {
+        let e = engine(vec![TaskConfig {
+            id: "t".into(),
+            kind: TaskKind::Shell { exec: "echo hello".into() },
+            when: None,
+            response_template: Some(r#"{"out":"{{tasks.t.stdout}}"}"#.into()),
+        }]);
+        let results = e.run("test").await.unwrap();
+        let resp = results[0].response.as_deref().unwrap();
+        assert!(resp.contains("hello"));
     }
 }
