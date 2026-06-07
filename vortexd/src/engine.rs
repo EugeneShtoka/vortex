@@ -96,7 +96,7 @@ impl Engine {
         self.emit(Event::WorkflowStarted { run_id: run_id.clone(), workflow: workflow_name.to_string(), timestamp: started_at });
 
         let store = Store::open(&self.db_path)?;
-        let globals = store.get_all()?;
+        let mut globals = store.get_all()?;
         store.insert_run(&run_id, workflow_name, &serde_json::to_string(&self.trigger_params).unwrap_or_else(|_| "{}".into()), started_at)?;
 
         let all_ids: Vec<&str> = self.config.tasks.iter().map(|t| t.id.as_str()).collect();
@@ -134,6 +134,14 @@ impl Engine {
                     match template::render(tmpl, &rmap, &globals, &self.trigger_params, &self.correlation_id) {
                         Ok(rendered) => result.response = Some(rendered),
                         Err(e) => error!(task = %task.id, "response_template render error: {e:#}"),
+                    }
+                }
+            }
+
+            if result.success {
+                if let TaskKind::StoreSet { set } = &task.kind {
+                    if let Ok(rendered) = render_map(set, &results, &globals, &self.trigger_params, &self.correlation_id) {
+                        globals.extend(rendered);
                     }
                 }
             }
@@ -227,10 +235,6 @@ impl Engine {
             TaskKind::StoreSet { set } => {
                 let rendered = render_map(set, results, globals, &self.trigger_params, cid)?;
                 execute_store_set(rendered, &self.db_path).await
-            }
-            TaskKind::StoreGet { get } => {
-                let key = template::render(get, results, globals, &self.trigger_params, cid)?;
-                execute_store_get(&key, &self.db_path).await
             }
             TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
             TaskKind::Spawn { exe, args } => {
@@ -414,12 +418,6 @@ async fn execute_store_set(set: HashMap<String, String>, db_path: &str) -> Resul
     Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
 }
 
-async fn execute_store_get(key: &str, db_path: &str) -> Result<TaskOutcome> {
-    let store = Store::open(db_path)?;
-    let value = store.get(key)?.unwrap_or_default();
-    let output = Some(serde_json::Value::String(value.clone()));
-    Ok(TaskOutcome { stdout: value, stderr: String::new(), exit_code: 0, success: true, output, status: None })
-}
 
 fn render_map(map: &HashMap<String, String>, results: &HashMap<String, TaskResult>, globals: &HashMap<String, String>, params: &HashMap<String, String>, cid: &str) -> Result<HashMap<String, String>> {
     map.iter().map(|(k, v)| template::render(v, results, globals, params, cid).map(|r| (k.clone(), r))).collect()
@@ -711,18 +709,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_set_then_get_across_tasks() {
+    async fn store_set_updates_globals_within_same_run() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
         let wf = workflow(vec![
             TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, response_template: None },
-            TaskConfig { id: "read".into(), kind: TaskKind::StoreGet { get: "mykey".into() }, when: Some("save".into()), response_template: None },
+            TaskConfig { id: "use".into(),  kind: TaskKind::Shell { exec: "echo {{globals.mykey}}".into() }, when: Some("save".into()), response_template: None },
         ]);
         let e = Engine::new(wf, &db);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[1].success);
-        assert_eq!(results[1].stdout.trim(), "hello");
+        assert!(results[1].stdout.contains("hello"));
     }
 
     #[test]

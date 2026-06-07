@@ -111,8 +111,7 @@ Every task requires a `type` field:
 | `http`       | `url`               | HTTP request; optional `method`, `headers`, `body`; success = 2xx |
 | `email`      | `to`, `subject`, `body` | Send email via SMTP; requires `[email]` config section; optional `cc` |
 | `sleep`      | `duration`          | Pause execution; formats: `100ms`, `5s`, `2m` |
-| `store_set`  | `set`               | Write one or more key/value pairs to the SQLite global store |
-| `store_get`  | `get`               | Read a key from the SQLite global store; value lands in `{{tasks.<id>.stdout}}` |
+| `store_set`  | `set`               | Write one or more key/value pairs to the SQLite global store; values are immediately visible as `{{globals.<key>}}` in subsequent tasks |
 
 Any task (including `shell`/`spawn`) can also carry `response_template` — a template rendered after the task succeeds, which becomes the workflow response. If more than one task produces a response, a warning is logged and the last one wins.
 
@@ -151,7 +150,7 @@ Any task (including `shell`/`spawn`) can also carry `response_template` — a te
 | `{{tasks.<id>.success}}` | `true` / `false` |
 | `{{tasks.<id>.exit_code}}` | Integer exit code |
 | `{{env.<NAME>}}` | Environment variable |
-| `{{globals.<key>}}` | Value from the SQLite global store |
+| `{{globals.<key>}}` | Value from the SQLite global store; updated immediately when a `store_set` task runs |
 
 Missing keys render as empty string (non-strict mode).
 

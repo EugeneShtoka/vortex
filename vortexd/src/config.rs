@@ -67,7 +67,6 @@ pub enum TaskKind {
     Email   { to: String, subject: String, body: String, cc: Option<String> },
     Sleep   { duration: String },
     StoreSet { set: HashMap<String, String> },
-    StoreGet { get: String },
     Peer    { vortex: String, trigger: String, #[serde(default)] params: HashMap<String, String> },
     /// Spawns a binary directly (no shell). Trigger params JSON is piped to stdin and set as
     /// VORTEX_TRIGGER_PARAMS. Each element of `args` is passed as a separate argv entry —
@@ -237,7 +236,6 @@ tasks = [
   { id = "notify_task", type = "notify",    topic = "alerts", message = "done" },
   { id = "email_task",  type = "email",     to = "a@b.com", subject = "Hi", body = "body" },
   { id = "store_set",   type = "store_set", set = { version = "1.0" } },
-  { id = "store_get",   type = "store_get", get = "version" },
 ]
 "#;
 
@@ -245,14 +243,13 @@ tasks = [
     fn parses_all_task_kinds() {
         let cfg = parse_config(TASK_TYPES_SAMPLE).unwrap();
         let tasks = &cfg.workflows["test"].tasks;
-        assert_eq!(tasks.len(), 7);
+        assert_eq!(tasks.len(), 6);
         assert!(matches!(tasks[0].kind, TaskKind::Shell { .. }));
         assert!(matches!(tasks[1].kind, TaskKind::Http  { .. }));
         assert!(matches!(tasks[2].kind, TaskKind::Sleep { .. }));
         assert!(matches!(tasks[3].kind, TaskKind::Notify { .. }));
         assert!(matches!(tasks[4].kind, TaskKind::Email  { .. }));
         assert!(matches!(tasks[5].kind, TaskKind::StoreSet { .. }));
-        assert!(matches!(tasks[6].kind, TaskKind::StoreGet { .. }));
     }
 
     #[test]
