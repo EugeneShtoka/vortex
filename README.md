@@ -102,13 +102,17 @@ tasks = [
 
 Every task requires a `type` field:
 
-| `type` | Required fields | Description |
+| `type`       | Required fields     | Description |
 |---|---|---|
-| `shell` | `exec` | Shell command string; templated, stdout captured |
-| `spawn` | `exe`, `args` | Binary + args array (no shell); trigger params JSON piped to stdin |
-| `response` | `template` | Renders template, no subprocess; output becomes workflow response |
-| `notify` | `topic`, `message` | Push via ntfy; optional `title`, `priority`, `tags`, `server`, `token` |
-| `http` | `url` | HTTP request; optional `method`, `headers`, `body` |
+| `shell`      | `exec`              | Shell command string; templated, stdout captured |
+| `spawn`      | `exe`, `args`       | Binary + args array (no shell); trigger params JSON piped to stdin and in `VORTEX_TRIGGER_PARAMS` |
+| `response`   | `template`          | Renders template, no subprocess; output becomes the workflow response |
+| `notify`     | `topic`, `message`  | Push notification via ntfy; optional `title`, `priority`, `tags`, `server`, `token` |
+| `http`       | `url`               | HTTP request; optional `method`, `headers`, `body`; success = 2xx |
+| `email`      | `to`, `subject`, `body` | Send email via SMTP; requires `[email]` config section; optional `cc` |
+| `sleep`      | `duration`          | Pause execution; formats: `100ms`, `5s`, `2m` |
+| `store_set`  | `set`               | Write one or more key/value pairs to the SQLite global store |
+| `store_get`  | `get`               | Read a key from the SQLite global store; value lands in `{{tasks.<id>.stdout}}` |
 
 Any task (including `shell`/`spawn`) can also carry `response_template` — a template rendered after the task succeeds, which becomes the workflow response. If more than one task produces a response, a warning is logged and the last one wins.
 
