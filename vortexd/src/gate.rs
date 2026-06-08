@@ -1,72 +1,131 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use evalexpr::*;
+use cel_interpreter::{Context, Program, Value};
 
 use crate::engine::TaskResult;
 
-/// Evaluate a gate expression against the current set of task results.
+/// Evaluate a CEL gate expression against the full workflow context.
 ///
-/// Supports the natural-language operators from `vortex.yaml` as well as
-/// their symbolic equivalents:
+/// Context variables available in `expr`:
 ///
-/// | YAML style          | Symbolic  |
-/// |---------------------|-----------|
-/// | `NOT a`             | `!a`      |
-/// | `a AND b`           | `a && b`  |
-/// | `a OR b`            | `a \|\| b`|
-/// | `(a AND b) OR c`    | same      |
+/// | Variable                     | Type    | Example                                    |
+/// |------------------------------|---------|--------------------------------------------|
+/// | `tasks.<id>.success`         | bool    | `tasks.build.success`                      |
+/// | `tasks.<id>.stdout`          | string  | `tasks.price.stdout`                       |
+/// | `tasks.<id>.stderr`          | string  | `tasks.build.stderr`                       |
+/// | `tasks.<id>.exit_code`       | int     | `tasks.build.exit_code == 0`               |
+/// | `trigger.<key>`              | string  | `trigger.sender == "@alice:server"`        |
+/// | `env.<KEY>`                  | any     | `trigger.sender in env.MATRIX_CONTACTS`    |
+/// | `globals.<key>`              | string  | `globals.deploy_count`                     |
+/// | `correlation_id`             | string  | `correlation_id == "req-1"`                |
+/// | `<task_id>`                  | bool    | `build` (backward-compat bare task bools)  |
 ///
-/// Any task ID not present in `results` (skipped / not yet run) is treated
-/// as `false`. `all_task_ids` pre-populates the context so evalexpr never
-/// sees undefined-variable errors for known tasks.
+/// Natural-language boolean keywords (`AND`, `OR`, `NOT`) are accepted alongside
+/// their symbolic equivalents (`&&`, `||`, `!`).
 pub fn evaluate(
     expr: &str,
     results: &HashMap<String, TaskResult>,
-    all_task_ids: &[&str],
+    all_ids: &[&str],
+    trigger_params: &HashMap<String, String>,
+    globals: &HashMap<String, String>,
+    correlation_id: &str,
 ) -> Result<bool> {
     let normalized = normalize(expr);
-    let mut ctx = HashMapContext::new();
+    let program = Program::compile(&normalized)
+        .map_err(|e| anyhow::anyhow!("Gate compile error in '{expr}': {e}"))?;
 
-    for &id in all_task_ids {
-        ctx.set_value(id.to_string(), Value::Boolean(false))?;
-    }
-    for (id, result) in results {
-        ctx.set_value(id.clone(), Value::Boolean(result.success))?;
+    let mut ctx = Context::default();
+
+    // tasks.{id}.{success, stdout, stderr, exit_code} — all task IDs present; unrun → defaults
+    let tasks_json: serde_json::Value = {
+        let mut m = serde_json::Map::new();
+        for &id in all_ids {
+            let entry = match results.get(id) {
+                Some(r) => serde_json::json!({
+                    "success":   r.success,
+                    "stdout":    r.stdout.trim(),
+                    "stderr":    r.stderr.trim(),
+                    "exit_code": r.exit_code,
+                }),
+                None => serde_json::json!({
+                    "success":   false,
+                    "stdout":    "",
+                    "stderr":    "",
+                    "exit_code": -1,
+                }),
+            };
+            m.insert(id.to_string(), entry);
+        }
+        serde_json::Value::Object(m)
+    };
+    ctx.add_variable_from_value("tasks", to_cel(&tasks_json)?);
+
+    // trigger.{key}
+    ctx.add_variable_from_value("trigger", to_cel(trigger_params)?);
+
+    // env.{KEY} — JSON-parsed where possible
+    let env_json: serde_json::Value = serde_json::Value::Object(
+        std::env::vars()
+            .map(|(k, v)| {
+                let val = serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v));
+                (k, val)
+            })
+            .collect(),
+    );
+    ctx.add_variable_from_value("env", to_cel(&env_json)?);
+
+    // globals.{key}
+    ctx.add_variable_from_value("globals", to_cel(globals)?);
+
+    // correlation_id
+    ctx.add_variable_from_value("correlation_id", to_cel(correlation_id)?);
+
+    // backward compat: bare task-ID booleans for `when = "task_id"` style
+    for &id in all_ids {
+        if is_cel_ident(id) {
+            let success = results.get(id).map_or(false, |r| r.success);
+            if let Ok(v) = to_cel(&success) {
+                ctx.add_variable_from_value(id, v);
+            }
+        }
     }
 
-    eval_boolean_with_context(&normalized, &ctx)
-        .map_err(|e| anyhow::anyhow!("Gate expression error in '{expr}': {e}"))
+    match program.execute(&ctx) {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(other) => Err(anyhow::anyhow!("Gate expression '{expr}' returned {other:?}, expected bool")),
+        // Undeclared variable = task ID not registered → treat as false (not yet run / unknown)
+        Err(e) if e.to_string().contains("Undeclared reference") => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Gate eval error in '{expr}': {e}")),
+    }
 }
 
-/// Translate YAML-style boolean keywords to evalexpr operators.
+fn to_cel<T: serde::Serialize + ?Sized>(v: &T) -> Result<Value> {
+    cel_interpreter::to_value(v).map_err(|e| anyhow::anyhow!("CEL context serialization: {e}"))
+}
+
+fn is_cel_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().map_or(false, |c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
 fn normalize(expr: &str) -> String {
     expr.replace(" AND ", " && ")
         .replace(" OR ", " || ")
         .replace("NOT ", "!")
 }
 
-// ──────────────────────────────────────────────
-// Tests (written before implementation — TDD)
-// ──────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn r(id: &str, success: bool) -> (String, TaskResult) {
-        (
-            id.to_string(),
-            TaskResult {
-                id: id.into(),
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: if success { 0 } else { 1 },
-                success,
-                output: None,
-                status: None,
-                response: None,
-            },
-        )
+        (id.to_string(), TaskResult {
+            id: id.into(), stdout: String::new(), stderr: String::new(),
+            exit_code: if success { 0 } else { 1 }, success,
+            output: None, status: None, response: None,
+        })
     }
 
     fn results(pairs: &[(&str, bool)]) -> HashMap<String, TaskResult> {
@@ -77,115 +136,118 @@ mod tests {
         pairs.iter().map(|&(id, _)| id).collect()
     }
 
-    // --- simple task reference ---
+    fn eval(expr: &str, pairs: &[(&str, bool)]) -> bool {
+        evaluate(expr, &results(pairs), &ids(pairs), &HashMap::new(), &HashMap::new(), "").unwrap()
+    }
+
+    // --- backward-compat bare task booleans ---
 
     #[test]
-    fn bare_id_passes_when_succeeded() {
-        let data = &[("pull_code", true)];
-        assert!(evaluate("pull_code", &results(data), &ids(data)).unwrap());
+    fn bare_id_true_when_succeeded() {
+        assert!(eval("build", &[("build", true)]));
     }
 
     #[test]
-    fn bare_id_fails_when_task_failed() {
-        let data = &[("pull_code", false)];
-        assert!(!evaluate("pull_code", &results(data), &ids(data)).unwrap());
+    fn bare_id_false_when_failed() {
+        assert!(!eval("build", &[("build", false)]));
     }
 
     #[test]
-    fn undefined_task_is_false() {
-        assert!(!evaluate("ghost", &HashMap::new(), &["ghost"]).unwrap());
-    }
-
-    // --- NOT ---
-
-    #[test]
-    fn not_yaml_style_inverts() {
-        let data = &[("step", false)];
-        assert!(evaluate("NOT step", &results(data), &ids(data)).unwrap());
+    fn bare_id_false_when_not_run() {
+        assert!(!eval("build", &[]));
     }
 
     #[test]
-    fn not_symbolic_inverts() {
-        let data = &[("step", false)];
-        assert!(evaluate("!step", &results(data), &ids(data)).unwrap());
+    fn not_inverts() {
+        assert!(eval("NOT build", &[("build", false)]));
+        assert!(!eval("NOT build", &[("build", true)]));
     }
 
     #[test]
-    fn not_true_is_false() {
-        let data = &[("step", true)];
-        assert!(!evaluate("NOT step", &results(data), &ids(data)).unwrap());
-    }
-
-    // --- AND ---
-
-    #[test]
-    fn and_yaml_both_true() {
-        let data = &[("a", true), ("b", true)];
-        assert!(evaluate("a AND b", &results(data), &ids(data)).unwrap());
+    fn and_expression() {
+        assert!(eval("a AND b",  &[("a", true),  ("b", true)]));
+        assert!(!eval("a AND b", &[("a", true),  ("b", false)]));
+        assert!(!eval("a AND b", &[("a", false), ("b", true)]));
     }
 
     #[test]
-    fn and_yaml_one_false() {
-        let data = &[("a", true), ("b", false)];
-        assert!(!evaluate("a AND b", &results(data), &ids(data)).unwrap());
+    fn or_expression() {
+        assert!(eval("a OR b",  &[("a", false), ("b", true)]));
+        assert!(!eval("a OR b", &[("a", false), ("b", false)]));
     }
 
     #[test]
-    fn and_symbolic() {
-        let data = &[("a", true), ("b", true)];
-        assert!(evaluate("a && b", &results(data), &ids(data)).unwrap());
+    fn complex_parens() {
+        assert!(eval("(a AND b) OR c",  &[("a", true),  ("b", false), ("c", true)]));
+        assert!(!eval("(a AND b) OR c", &[("a", true),  ("b", false), ("c", false)]));
     }
 
-    // --- OR ---
+    // --- tasks.* dot notation ---
 
     #[test]
-    fn or_yaml_one_true() {
-        let data = &[("a", false), ("b", true)];
-        assert!(evaluate("a OR b", &results(data), &ids(data)).unwrap());
-    }
-
-    #[test]
-    fn or_yaml_both_false() {
-        let data = &[("a", false), ("b", false)];
-        assert!(!evaluate("a OR b", &results(data), &ids(data)).unwrap());
+    fn tasks_success_field() {
+        assert!(eval("tasks.build.success",  &[("build", true)]));
+        assert!(!eval("tasks.build.success", &[("build", false)]));
     }
 
     #[test]
-    fn or_symbolic() {
-        let data = &[("a", false), ("b", true)];
-        assert!(evaluate("a || b", &results(data), &ids(data)).unwrap());
-    }
-
-    // --- complex ---
-
-    #[test]
-    fn complex_and_or_with_parens() {
-        // a=T, b=F, c=T → (a AND b) OR c = F OR T = T
-        let data = &[("a", true), ("b", false), ("c", true)];
-        assert!(evaluate("(a AND b) OR c", &results(data), &ids(data)).unwrap());
-        // a=T, b=F, c=F → a AND (b OR c) = T AND F = F
-        let data2 = &[("a", true), ("b", false), ("c", false)];
-        assert!(!evaluate("a AND (b OR c)", &results(data2), &ids(data2)).unwrap());
+    fn tasks_exit_code_comparison() {
+        let mut rs = results(&[("build", false)]);
+        rs.get_mut("build").unwrap().exit_code = 42;
+        assert!(evaluate("tasks.build.exit_code == 42", &rs, &["build"], &HashMap::new(), &HashMap::new(), "").unwrap());
+        assert!(!evaluate("tasks.build.exit_code == 0", &rs, &["build"], &HashMap::new(), &HashMap::new(), "").unwrap());
     }
 
     #[test]
-    fn complex_nested_all_false() {
-        // a=T, b=F, c=F → (a AND b) OR c = F OR F = F
-        let data = &[("a", true), ("b", false), ("c", false)];
-        assert!(!evaluate("(a AND b) OR c", &results(data), &ids(data)).unwrap());
+    fn tasks_stdout_string_eq() {
+        let mut rs = results(&[("price", true)]);
+        rs.get_mut("price").unwrap().stdout = "150\n".into();
+        assert!(evaluate("tasks.price.stdout == \"150\"", &rs, &["price"], &HashMap::new(), &HashMap::new(), "").unwrap());
     }
 
+    // --- trigger.* ---
+
     #[test]
-    fn complex_not_with_and() {
-        // NOT a AND b → !a && b = F && T = F
-        let data = &[("a", true), ("b", true)];
-        assert!(!evaluate("NOT a AND b", &results(data), &ids(data)).unwrap());
+    fn trigger_field_eq() {
+        let mut params = HashMap::new();
+        params.insert("event_id".into(), "".into());
+        assert!(evaluate("trigger.event_id == \"\"", &HashMap::new(), &[], &params, &HashMap::new(), "").unwrap());
+        params.insert("event_id".into(), "$abc:server".into());
+        assert!(!evaluate("trigger.event_id == \"\"", &HashMap::new(), &[], &params, &HashMap::new(), "").unwrap());
     }
 
-    // --- error cases ---
+    // --- env.* with JSON list membership ---
 
     #[test]
-    fn invalid_expression_returns_error() {
-        assert!(evaluate("((broken", &HashMap::new(), &[]).is_err());
+    fn env_list_membership() {
+        std::env::set_var("VORTEX_TEST_CONTACTS", r#"["@alice:server","@bob:server"]"#);
+        let mut params = HashMap::new();
+        params.insert("sender".into(), "@alice:server".into());
+        assert!(evaluate("trigger.sender in env.VORTEX_TEST_CONTACTS", &HashMap::new(), &[], &params, &HashMap::new(), "").unwrap());
+        params.insert("sender".into(), "@unknown:server".into());
+        assert!(!evaluate("trigger.sender in env.VORTEX_TEST_CONTACTS", &HashMap::new(), &[], &params, &HashMap::new(), "").unwrap());
+        std::env::remove_var("VORTEX_TEST_CONTACTS");
+    }
+
+    // --- globals ---
+
+    #[test]
+    fn globals_field_eq() {
+        let mut globals = HashMap::new();
+        globals.insert("mode".into(), "active".into());
+        assert!(evaluate("globals.mode == \"active\"", &HashMap::new(), &[], &HashMap::new(), &globals, "").unwrap());
+    }
+
+    // --- combined ---
+
+    #[test]
+    fn combined_task_and_trigger() {
+        let rs = results(&[("check", true)]);
+        let mut params = HashMap::new();
+        params.insert("event_id".into(), "".into());
+        assert!(evaluate(
+            "check AND trigger.event_id == \"\"",
+            &rs, &["check"], &params, &HashMap::new(), ""
+        ).unwrap());
     }
 }

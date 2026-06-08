@@ -49,7 +49,15 @@ pub struct TaskConfig {
     pub id: String,
     #[serde(flatten)]
     pub kind: TaskKind,
+    /// CEL expression evaluated at runtime. Has access to `tasks.<id>.{success,stdout,
+    /// stderr,exit_code}`, `trigger.<key>`, `env.<KEY>` (JSON-parsed), `globals.<key>`,
+    /// `correlation_id`, and bare task-ID booleans for backward compat.
     pub when: Option<String>,
+    /// Explicit ordering dependencies. Tasks listed here are guaranteed to run before
+    /// this task regardless of `when`. When omitted, deps are inferred from task-ID
+    /// tokens in `when` for backward compat.
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
     /// Handlebars template rendered after the task succeeds. The rendered string
     /// becomes the workflow response instead of raw stdout. Has access to all prior
     /// task results (including this task's own stdout via `{{tasks.<id>.stdout}}`),

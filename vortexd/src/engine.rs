@@ -258,11 +258,11 @@ impl Engine {
         globals: &HashMap<String, String>,
     ) -> Result<bool> {
         let Some(expr) = &task.when else { return Ok(true) };
-        let rendered = template::render(expr, results, globals, &self.trigger_params, &self.correlation_id)?;
-        gate::evaluate(&rendered, results, all_ids)
+        gate::evaluate(expr, results, all_ids, &self.trigger_params, globals, &self.correlation_id)
     }
 
-    /// Kahn's topological sort over task dependency edges extracted from `when` expressions.
+    /// Kahn's topological sort. Deps come from `depends_on` when set; otherwise
+    /// inferred by scanning `when` for tokens that match task IDs (backward compat).
     fn topological_sort(&self) -> Result<Vec<TaskConfig>> {
         let tasks = &self.config.tasks;
         let task_ids: HashMap<&str, usize> =
@@ -270,8 +270,16 @@ impl Engine {
 
         let mut deps: Vec<Vec<usize>> = vec![vec![]; tasks.len()];
         for (i, task) in tasks.iter().enumerate() {
-            if let Some(expr) = &task.when {
-                let mut seen = std::collections::HashSet::new();
+            let mut seen = std::collections::HashSet::new();
+            if let Some(explicit) = &task.depends_on {
+                for dep_id in explicit {
+                    match task_ids.get(dep_id.as_str()) {
+                        Some(&j) if seen.insert(j) => deps[i].push(j),
+                        Some(_) => {}
+                        None => bail!("Task '{}' depends_on unknown task '{dep_id}'", task.id),
+                    }
+                }
+            } else if let Some(expr) = &task.when {
                 for token in expr.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
                     if token.is_empty() || matches!(token, "AND" | "OR" | "NOT") {
                         continue;
@@ -445,7 +453,7 @@ mod tests {
     use crate::event::Event;
 
     fn task(id: &str, exec: &str, when: Option<&str>) -> TaskConfig {
-        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string), response_template: None }
+        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string), depends_on: None, response_template: None }
     }
 
     fn workflow(tasks: Vec<TaskConfig>) -> WorkflowConfig {
@@ -668,14 +676,14 @@ mod tests {
         assert_eq!(skip_task.status, "skipped");
     }
 
-    // --- Sprint 12: numeric gate expressions ---
+    // --- CEL gate expressions ---
 
     #[tokio::test]
-    async fn run_numeric_gate_routes_by_exit_code() {
+    async fn run_cel_gate_routes_by_exit_code() {
         let e = engine(vec![
             task("build", "exit 42", None),
-            task("on_42", "echo matched",     Some("{{tasks.build.exit_code}} == 42")),
-            task("on_0",  "echo not_matched", Some("{{tasks.build.exit_code}} == 0")),
+            task("on_42", "echo matched",     Some("tasks.build.exit_code == 42")),
+            task("on_0",  "echo not_matched", Some("tasks.build.exit_code == 0")),
         ]);
         let results = e.run("test").await.unwrap();
         assert!(results.iter().any(|r| r.id == "on_42" && r.success));
@@ -683,15 +691,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_numeric_gate_compares_stdout_value() {
+    async fn run_cel_gate_compares_stdout_string() {
         let e = engine(vec![
-            task("price", "echo 150",      None),
-            task("alert", "echo triggered", Some("{{tasks.price.stdout}} > 100")),
-            task("skip",  "echo skipped",   Some("{{tasks.price.stdout}} > 200")),
+            task("step",   "echo hello", None),
+            task("match",  "echo yes",   Some("tasks.step.stdout == \"hello\"")),
+            task("nomatch","echo no",    Some("tasks.step.stdout == \"other\"")),
         ]);
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "alert" && r.success));
-        assert!(!results.iter().any(|r| r.id == "skip"));
+        assert!(results.iter().any(|r| r.id == "match" && r.success));
+        assert!(!results.iter().any(|r| r.id == "nomatch"));
+    }
+
+    #[tokio::test]
+    async fn run_cel_gate_trigger_field() {
+        let e = engine(vec![
+            task("notify", "echo ok", Some("trigger.event_id == \"\"")),
+        ]).with_params(HashMap::from([("event_id".into(), "".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "notify" && r.success));
+    }
+
+    #[tokio::test]
+    async fn run_cel_gate_trigger_field_blocks_when_nonempty() {
+        let e = engine(vec![
+            task("notify", "echo ok", Some("trigger.event_id == \"\"")),
+        ]).with_params(HashMap::from([("event_id".into(), "$abc:server".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(!results.iter().any(|r| r.id == "notify"));
     }
 
     // --- Sprint 13: new task types ---
@@ -701,7 +727,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "wait".into(),
             kind: TaskKind::Sleep { duration: "10ms".into() },
-            when: None, response_template: None,
+            when: None, depends_on: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -713,8 +739,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
         let wf = workflow(vec![
-            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, response_template: None },
-            TaskConfig { id: "use".into(),  kind: TaskKind::Shell { exec: "echo {{globals.mykey}}".into() }, when: Some("save".into()), response_template: None },
+            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, depends_on: None, response_template: None },
+            TaskConfig { id: "use".into(),  kind: TaskKind::Shell { exec: "echo {{globals.mykey}}".into() }, when: Some("save".into()), depends_on: None, response_template: None },
         ]);
         let e = Engine::new(wf, &db);
         let results = e.run("test").await.unwrap();
@@ -742,7 +768,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "greet".into(),
             kind: TaskKind::Spawn { exe: "echo".into(), args: vec!["hello".into(), "world".into()] },
-            when: None, response_template: None,
+            when: None, depends_on: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -755,7 +781,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "ok".into(),
             kind: TaskKind::Spawn { exe: "true".into(), args: vec![] },
-            when: None, response_template: None,
+            when: None, depends_on: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -767,7 +793,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "fail".into(),
             kind: TaskKind::Spawn { exe: "false".into(), args: vec![] },
-            when: None, response_template: None,
+            when: None, depends_on: None, response_template: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(!results[0].success);
@@ -780,7 +806,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "echo_params".into(),
             kind: TaskKind::Spawn { exe: "cat".into(), args: vec![] },
-            when: None, response_template: None,
+            when: None, depends_on: None, response_template: None,
         }]).with_params(HashMap::from([("Body".into(), "hello".into()), ("Sender".into(), "@user".into())]));
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -792,8 +818,8 @@ mod tests {
     #[tokio::test]
     async fn spawn_task_gates_on_exit_code() {
         let e = engine(vec![
-            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None, response_template: None },
-            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), response_template: None },
+            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None, depends_on: None, response_template: None },
+            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), depends_on: None, response_template: None },
         ]);
         let results = e.run("test").await.unwrap();
         assert!(results.iter().any(|r| r.id == "filter" && !r.success));
@@ -810,6 +836,7 @@ mod tests {
                 id: "reply".into(),
                 kind: TaskKind::Response { template: "got={{tasks.hello.stdout}}".into() },
                 when: Some("hello".into()),
+                depends_on: None,
                 response_template: None,
             },
         ]);
@@ -825,6 +852,7 @@ mod tests {
             id: "r".into(),
             kind: TaskKind::Response { template: "msg={{trigger.text}}".into() },
             when: None,
+            depends_on: None,
             response_template: None,
         }]).with_params(HashMap::from([("text".into(), "hello".into())]));
         let results = e.run("test").await.unwrap();
@@ -837,6 +865,7 @@ mod tests {
             id: "r".into(),
             kind: TaskKind::Response { template: "id={{correlation_id}}".into() },
             when: None,
+            depends_on: None,
             response_template: None,
         }]).with_correlation_id("req-99".into());
         let results = e.run("test").await.unwrap();
@@ -851,6 +880,7 @@ mod tests {
             id: "t".into(),
             kind: TaskKind::Shell { exec: "echo raw".into() },
             when: None,
+            depends_on: None,
             response_template: Some("wrapped={{tasks.t.stdout}}".into()),
         }]);
         let results = e.run("test").await.unwrap();
@@ -864,6 +894,7 @@ mod tests {
             id: "t".into(),
             kind: TaskKind::Shell { exec: "exit 1".into() },
             when: None,
+            depends_on: None,
             response_template: Some("should_not_appear".into()),
         }]);
         let results = e.run("test").await.unwrap();
@@ -877,6 +908,7 @@ mod tests {
             id: "t".into(),
             kind: TaskKind::Shell { exec: "echo hello".into() },
             when: None,
+            depends_on: None,
             response_template: Some(r#"{"out":"{{tasks.t.stdout}}"}"#.into()),
         }]);
         let results = e.run("test").await.unwrap();
