@@ -85,6 +85,10 @@ pub enum TaskKind {
     /// globals, env vars, and `{{correlation_id}}`. Use as the last task in a workflow
     /// to explicitly shape the reply to the caller.
     Response { template: String },
+    /// Evaluates a CEL expression and exposes the result as task success/failure.
+    /// exit_code 0 = true, 1 = false, 2 = evaluation error.
+    /// Has access to the same context as `when` gates: tasks.*, trigger.*, env.*, globals.*.
+    Condition { expr: String },
 }
 
 fn default_method() -> String {
@@ -402,6 +406,22 @@ tasks = [{ id = "check", type = "spawn", exe = "spam.sh", response_template = "{
         let cfg = parse_config(toml).unwrap();
         let task = &cfg.workflows["w"].tasks[0];
         assert_eq!(task.response_template.as_deref(), Some("{\"status\":\"drop\"}"));
+    }
+
+    #[test]
+    fn parses_condition_task() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+[workflows.w]
+tasks = [{ id = "check", type = "condition", expr = "trigger.sender == \"@alice:server\"" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        if let TaskKind::Condition { expr } = &cfg.workflows["w"].tasks[0].kind {
+            assert_eq!(expr, "trigger.sender == \"@alice:server\"");
+        } else {
+            panic!("expected Condition kind");
+        }
     }
 
     #[test]

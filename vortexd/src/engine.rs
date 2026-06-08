@@ -247,6 +247,14 @@ impl Engine {
                     exit_code: 0, success: true, output: None, status: None,
                 })
             }
+            TaskKind::Condition { expr } => {
+                let all_ids: Vec<&str> = results.keys().map(String::as_str).collect();
+                match gate::evaluate(expr, results, &all_ids, &self.trigger_params, globals, cid) {
+                    Ok(true)  => Ok(TaskOutcome { stdout: "true".into(),  stderr: String::new(), exit_code: 0, success: true,  output: None, status: None }),
+                    Ok(false) => Ok(TaskOutcome { stdout: "false".into(), stderr: String::new(), exit_code: 1, success: false, output: None, status: None }),
+                    Err(e)    => Ok(TaskOutcome { stdout: String::new(),  stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
+                }
+            }
         }
     }
 
@@ -914,5 +922,59 @@ mod tests {
         let results = e.run("test").await.unwrap();
         let resp = results[0].response.as_deref().unwrap();
         assert!(resp.contains("hello"));
+    }
+
+    // --- Condition task ---
+
+    fn condition(id: &str, expr: &str) -> TaskConfig {
+        TaskConfig { id: id.into(), kind: TaskKind::Condition { expr: expr.into() }, when: None, depends_on: None, response_template: None }
+    }
+
+    #[tokio::test]
+    async fn condition_true_expr_succeeds_with_exit_code_0() {
+        let e = engine(vec![condition("c", "true")]);
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].exit_code, 0);
+        assert_eq!(results[0].stdout.trim(), "true");
+    }
+
+    #[tokio::test]
+    async fn condition_false_expr_fails_with_exit_code_1() {
+        let e = engine(vec![condition("c", "false")]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_eq!(results[0].exit_code, 1);
+        assert_eq!(results[0].stdout.trim(), "false");
+    }
+
+    #[tokio::test]
+    async fn condition_non_bool_expr_fails_with_exit_code_2() {
+        // "42" is valid CEL but returns Int, not Bool → gate returns Err → exit_code 2
+        let e = engine(vec![condition("c", "42")]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_eq!(results[0].exit_code, 2);
+        assert!(!results[0].stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn condition_reads_trigger_param() {
+        let e = engine(vec![condition("c", "trigger.x == \"yes\"")])
+            .with_params(HashMap::from([("x".into(), "yes".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn condition_gates_downstream_tasks() {
+        let e = engine(vec![
+            condition("is_even", "trigger.n == \"2\""),
+            task("on_even",  "echo even", Some("is_even")),
+            task("on_other", "echo other", Some("NOT is_even")),
+        ]).with_params(HashMap::from([("n".into(), "2".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!( results.iter().any(|r| r.id == "on_even"  && r.success));
+        assert!(!results.iter().any(|r| r.id == "on_other"));
     }
 }
