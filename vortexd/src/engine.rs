@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
+use cel_interpreter::Value as CelValue;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use lettre::transport::smtp::authentication::Credentials;
 use reqwest::Client;
@@ -248,6 +249,13 @@ impl Engine {
                     Err(e)    => Ok(TaskOutcome { stdout: String::new(),  stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
                 }
             }
+            TaskKind::Eval { expr } => {
+                let all_ids: Vec<&str> = results.keys().map(String::as_str).collect();
+                match gate::evaluate_value(expr, results, &all_ids, &self.trigger_params, globals, cid) {
+                    Ok(value) => Ok(cel_to_outcome(value)),
+                    Err(e)    => Ok(TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
+                }
+            }
         }
     }
 
@@ -411,6 +419,59 @@ async fn execute_store_set(set: HashMap<String, String>, db_path: &str) -> Resul
     Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
 }
 
+
+fn cel_to_outcome(value: CelValue) -> TaskOutcome {
+    let success = cel_is_truthy(&value);
+    let exit_code = if success { 0 } else { 1 };
+    match value {
+        CelValue::String(s) => {
+            let s = s.as_ref().clone();
+            TaskOutcome { stdout: s, stderr: String::new(), exit_code, success, output: None, status: None }
+        }
+        CelValue::Bool(b) => {
+            TaskOutcome { stdout: if b { "true" } else { "false" }.into(), stderr: String::new(), exit_code, success, output: Some(serde_json::Value::Bool(b)), status: None }
+        }
+        other => {
+            let json = cel_to_json(&other);
+            let stdout = json.to_string();
+            TaskOutcome { stdout, stderr: String::new(), exit_code, success, output: Some(json), status: None }
+        }
+    }
+}
+
+fn cel_is_truthy(val: &CelValue) -> bool {
+    match val {
+        CelValue::Bool(b)   => *b,
+        CelValue::String(s) => !s.is_empty(),
+        CelValue::Int(i)    => *i != 0,
+        CelValue::UInt(u)   => *u != 0,
+        CelValue::Float(f)  => *f != 0.0,
+        CelValue::Null      => false,
+        CelValue::List(l)   => !l.is_empty(),
+        CelValue::Map(m)    => !m.map.is_empty(),
+        CelValue::Bytes(b)  => !b.is_empty(),
+        _                   => true,
+    }
+}
+
+fn cel_to_json(val: &CelValue) -> serde_json::Value {
+    match val {
+        CelValue::Bool(b)   => serde_json::Value::Bool(*b),
+        CelValue::Int(i)    => serde_json::json!(i),
+        CelValue::UInt(u)   => serde_json::json!(u),
+        CelValue::Float(f)  => serde_json::json!(f),
+        CelValue::String(s) => serde_json::Value::String(s.as_ref().clone()),
+        CelValue::Null      => serde_json::Value::Null,
+        CelValue::List(l)   => serde_json::Value::Array(l.iter().map(cel_to_json).collect()),
+        CelValue::Map(m)    => serde_json::Value::Object(
+            m.map.iter().map(|(k, v)| (k.to_string(), cel_to_json(v))).collect()
+        ),
+        CelValue::Bytes(b)  => serde_json::Value::String(
+            b.iter().map(|byte| format!("{byte:02x}")).collect()
+        ),
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
 
 fn render_map(map: &HashMap<String, String>, results: &HashMap<String, TaskResult>, globals: &HashMap<String, String>, params: &HashMap<String, String>, cid: &str) -> Result<HashMap<String, String>> {
     map.iter().map(|(k, v)| template::render(v, results, globals, params, cid).map(|r| (k.clone(), r))).collect()
@@ -899,6 +960,91 @@ mod tests {
         let results = e.run("test").await.unwrap();
         let resp = results[0].response.as_deref().unwrap();
         assert!(resp.contains("hello"));
+    }
+
+    // --- Eval task ---
+
+    fn eval(id: &str, expr: &str) -> TaskConfig {
+        TaskConfig { id: id.into(), kind: TaskKind::Eval { expr: expr.into() }, when: None, depends_on: None, response_template: None }
+    }
+
+    #[tokio::test]
+    async fn eval_string_result_is_stdout() {
+        let e = engine(vec![eval("find", "\"friends\"")])
+            .with_params(HashMap::new());
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].exit_code, 0);
+        assert_eq!(results[0].stdout.trim(), "friends");
+        assert!(results[0].output.is_none());
+    }
+
+    #[tokio::test]
+    async fn eval_bool_true_succeeds() {
+        let e = engine(vec![eval("c", "true")]);
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].exit_code, 0);
+        assert_eq!(results[0].stdout.trim(), "true");
+    }
+
+    #[tokio::test]
+    async fn eval_bool_false_fails() {
+        let e = engine(vec![eval("c", "false")]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_eq!(results[0].exit_code, 1);
+        assert_eq!(results[0].stdout.trim(), "false");
+    }
+
+    #[tokio::test]
+    async fn eval_empty_string_fails() {
+        let e = engine(vec![eval("c", "\"\"")]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_eq!(results[0].exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn eval_error_fails_with_exit_2() {
+        // invalid CEL → compile error
+        let e = engine(vec![eval("c", "this is not valid $$$ cel")]);
+        let results = e.run("test").await.unwrap();
+        assert!(!results[0].success);
+        assert_eq!(results[0].exit_code, 2);
+        assert!(!results[0].stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn eval_reads_trigger_param() {
+        let e = engine(vec![eval("find", "trigger.space")])
+            .with_params(HashMap::from([("space".into(), "friends".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].stdout.trim(), "friends");
+    }
+
+    #[tokio::test]
+    async fn eval_gates_downstream_tasks() {
+        let e = engine(vec![
+            eval("find_space", "trigger.room == \"!abc:server\" ? \"friends\" : \"\""),
+            task("notify", "echo notified", Some("find_space")),
+            task("skip",   "echo skipped",  Some("NOT find_space")),
+        ]).with_params(HashMap::from([("room".into(), "!abc:server".into())]));
+        let results = e.run("test").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "find_space" && r.success && r.stdout.trim() == "friends"));
+        assert!(results.iter().any(|r| r.id == "notify" && r.success));
+        assert!(!results.iter().any(|r| r.id == "skip"));
+    }
+
+    #[tokio::test]
+    async fn eval_stdout_usable_in_downstream_template() {
+        let e = engine(vec![
+            eval("find_space", "\"friends\""),
+            task("use", "echo topic={{tasks.find_space.stdout}}", Some("find_space")),
+        ]);
+        let results = e.run("test").await.unwrap();
+        assert!(results[1].stdout.contains("topic=friends"));
     }
 
     // --- Condition task ---

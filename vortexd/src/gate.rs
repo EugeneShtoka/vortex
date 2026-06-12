@@ -6,6 +6,7 @@ use cel_interpreter::{Context, Program, Value};
 use crate::engine::TaskResult;
 
 /// Evaluate a CEL gate expression against the full workflow context.
+/// Returns `bool`; undeclared variable references → `false` (task not yet run).
 ///
 /// Context variables available in `expr`:
 ///
@@ -34,7 +35,41 @@ pub fn evaluate(
     let normalized = normalize(expr);
     let program = Program::compile(&normalized)
         .map_err(|e| anyhow::anyhow!("Gate compile error in '{expr}': {e}"))?;
+    let ctx = build_context(results, all_ids, trigger_params, globals, correlation_id)?;
+    match program.execute(&ctx) {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(other) => Err(anyhow::anyhow!("Gate expression '{expr}' returned {other:?}, expected bool")),
+        // Undeclared variable = task ID not registered → treat as false (not yet run / unknown)
+        Err(e) if e.to_string().contains("Undeclared reference") => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Gate eval error in '{expr}': {e}")),
+    }
+}
 
+/// Evaluate a CEL expression and return the raw value. All errors (including
+/// undeclared references and runtime panics like index-out-of-bounds) propagate
+/// as `Err` — callers map errors to task failure.
+pub fn evaluate_value(
+    expr: &str,
+    results: &HashMap<String, TaskResult>,
+    all_ids: &[&str],
+    trigger_params: &HashMap<String, String>,
+    globals: &HashMap<String, String>,
+    correlation_id: &str,
+) -> Result<Value> {
+    let normalized = normalize(expr);
+    let program = Program::compile(&normalized)
+        .map_err(|e| anyhow::anyhow!("Eval compile error in '{expr}': {e}"))?;
+    let ctx = build_context(results, all_ids, trigger_params, globals, correlation_id)?;
+    program.execute(&ctx).map_err(|e| anyhow::anyhow!("Eval error in '{expr}': {e}"))
+}
+
+fn build_context<'a>(
+    results: &'a HashMap<String, TaskResult>,
+    all_ids: &'a [&'a str],
+    trigger_params: &'a HashMap<String, String>,
+    globals: &'a HashMap<String, String>,
+    correlation_id: &'a str,
+) -> Result<Context<'a>> {
     let mut ctx = Context::default();
 
     // tasks.{id}.{success, stdout, stderr, exit_code} — all task IDs present; unrun → defaults
@@ -91,13 +126,7 @@ pub fn evaluate(
         }
     }
 
-    match program.execute(&ctx) {
-        Ok(Value::Bool(b)) => Ok(b),
-        Ok(other) => Err(anyhow::anyhow!("Gate expression '{expr}' returned {other:?}, expected bool")),
-        // Undeclared variable = task ID not registered → treat as false (not yet run / unknown)
-        Err(e) if e.to_string().contains("Undeclared reference") => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("Gate eval error in '{expr}': {e}")),
-    }
+    Ok(ctx)
 }
 
 fn to_cel<T: serde::Serialize + ?Sized>(v: &T) -> Result<Value> {

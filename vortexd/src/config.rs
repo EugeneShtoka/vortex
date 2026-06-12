@@ -88,6 +88,13 @@ pub enum TaskKind {
     /// exit_code 0 = true, 1 = false, 2 = evaluation error.
     /// Has access to the same context as `when` gates: tasks.*, trigger.*, env.*, globals.*.
     Condition { expr: String },
+    /// Evaluates a CEL expression and returns the result as stdout.
+    /// Success/failure is determined by truthiness: non-empty string, true, non-zero int,
+    /// non-empty list/map succeed; false, empty string, 0, empty list/map, null fail.
+    /// Evaluation errors (including index-out-of-bounds) also fail.
+    /// Supersedes `condition` — bool expressions work identically; use this when the
+    /// result value is needed downstream via `{{tasks.<id>.stdout}}` or `output`.
+    Eval { expr: String },
 }
 
 fn default_method() -> String {
@@ -246,6 +253,7 @@ tasks = [
   { id = "sleep_task",  type = "sleep",     duration = "100ms" },
   { id = "email_task",  type = "email",     to = "a@b.com", subject = "Hi", body = "body" },
   { id = "store_set",   type = "store_set", set = { version = "1.0" } },
+  { id = "eval_task",   type = "eval",      expr = "trigger.x == \"y\"" },
 ]
 "#;
 
@@ -253,12 +261,13 @@ tasks = [
     fn parses_all_task_kinds() {
         let cfg = parse_config(TASK_TYPES_SAMPLE).unwrap();
         let tasks = &cfg.workflows["test"].tasks;
-        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks.len(), 6);
         assert!(matches!(tasks[0].kind, TaskKind::Shell { .. }));
         assert!(matches!(tasks[1].kind, TaskKind::Http  { .. }));
         assert!(matches!(tasks[2].kind, TaskKind::Sleep { .. }));
         assert!(matches!(tasks[3].kind, TaskKind::Email  { .. }));
         assert!(matches!(tasks[4].kind, TaskKind::StoreSet { .. }));
+        assert!(matches!(tasks[5].kind, TaskKind::Eval { .. }));
     }
 
     #[test]
@@ -418,6 +427,22 @@ tasks = [{ id = "check", type = "condition", expr = "trigger.sender == \"@alice:
             assert_eq!(expr, "trigger.sender == \"@alice:server\"");
         } else {
             panic!("expected Condition kind");
+        }
+    }
+
+    #[test]
+    fn parses_eval_task() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+[workflows.w]
+tasks = [{ id = "find", type = "eval", expr = "env.SPACES.filter(s, s.id == trigger.room).map(s, s.name)[0]" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        if let TaskKind::Eval { expr } = &cfg.workflows["w"].tasks[0].kind {
+            assert!(expr.contains("SPACES"));
+        } else {
+            panic!("expected Eval kind");
         }
     }
 
