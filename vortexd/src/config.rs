@@ -71,7 +71,6 @@ pub struct TaskConfig {
 pub enum TaskKind {
     Shell   { exec: String },
     Http    { url: String, #[serde(default = "default_method")] method: String, #[serde(default)] headers: HashMap<String, String>, body: Option<String> },
-    Notify  { topic: String, message: String, title: Option<String>, priority: Option<String>, tags: Option<String>, server: Option<String>, token: Option<String> },
     Email   { to: String, subject: String, body: String, cc: Option<String> },
     Sleep   { duration: String },
     StoreSet { set: HashMap<String, String> },
@@ -245,7 +244,6 @@ tasks = [
   { id = "shell_task",  type = "shell",     exec = "echo hi" },
   { id = "http_task",   type = "http",      url = "https://example.com/api", method = "POST", body = "{}" },
   { id = "sleep_task",  type = "sleep",     duration = "100ms" },
-  { id = "notify_task", type = "notify",    topic = "alerts", message = "done" },
   { id = "email_task",  type = "email",     to = "a@b.com", subject = "Hi", body = "body" },
   { id = "store_set",   type = "store_set", set = { version = "1.0" } },
 ]
@@ -255,13 +253,12 @@ tasks = [
     fn parses_all_task_kinds() {
         let cfg = parse_config(TASK_TYPES_SAMPLE).unwrap();
         let tasks = &cfg.workflows["test"].tasks;
-        assert_eq!(tasks.len(), 6);
+        assert_eq!(tasks.len(), 5);
         assert!(matches!(tasks[0].kind, TaskKind::Shell { .. }));
         assert!(matches!(tasks[1].kind, TaskKind::Http  { .. }));
         assert!(matches!(tasks[2].kind, TaskKind::Sleep { .. }));
-        assert!(matches!(tasks[3].kind, TaskKind::Notify { .. }));
-        assert!(matches!(tasks[4].kind, TaskKind::Email  { .. }));
-        assert!(matches!(tasks[5].kind, TaskKind::StoreSet { .. }));
+        assert!(matches!(tasks[3].kind, TaskKind::Email  { .. }));
+        assert!(matches!(tasks[4].kind, TaskKind::StoreSet { .. }));
     }
 
     #[test]

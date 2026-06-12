@@ -217,13 +217,6 @@ impl Engine {
                 let hdrs = render_map(headers, results, globals, &self.trigger_params, cid)?;
                 execute_http(method, &url, &hdrs, body.as_deref()).await
             }
-            TaskKind::Notify { server, topic, message, title, priority, tags, token } => {
-                let msg   = template::render(message, results, globals, &self.trigger_params, cid)?;
-                let title = title.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params, cid)).transpose()?;
-                let tok   = token.as_ref().map(|t| template::render(t, results, globals, &self.trigger_params, cid)).transpose()?;
-                let srv   = server.as_deref().unwrap_or("https://ntfy.sh");
-                execute_notify(srv, topic, &msg, title.as_deref(), priority.as_deref(), tags.as_deref(), tok.as_deref()).await
-            }
             TaskKind::Email { to, subject, body, cc } => {
                 let subject = template::render(subject, results, globals, &self.trigger_params, cid)?;
                 let body    = template::render(body, results, globals, &self.trigger_params, cid)?;
@@ -385,22 +378,6 @@ async fn execute_http(method: &str, url: &str, headers: &HashMap<String, String>
         stdout: body_text, stderr: String::new(),
         exit_code: http_status.as_u16() as i32, success: http_status.is_success(),
         output: parsed, status: Some(http_status.as_u16()),
-    })
-}
-
-async fn execute_notify(server: &str, topic: &str, message: &str, title: Option<&str>, priority: Option<&str>, tags: Option<&str>, token: Option<&str>) -> Result<TaskOutcome> {
-    let mut req = Client::new().post(format!("{server}/{topic}")).body(message.to_string());
-    if let Some(t) = title    { req = req.header("Title",         t); }
-    if let Some(p) = priority { req = req.header("Priority",      p); }
-    if let Some(t) = tags     { req = req.header("Tags",          t); }
-    if let Some(t) = token    { req = req.header("Authorization", format!("Bearer {t}")); }
-    let resp   = req.send().await?;
-    let status = resp.status();
-    let body   = resp.text().await.unwrap_or_default();
-    Ok(TaskOutcome {
-        stdout: body, stderr: String::new(),
-        exit_code: status.as_u16() as i32, success: status.is_success(),
-        output: None, status: Some(status.as_u16()),
     })
 }
 
