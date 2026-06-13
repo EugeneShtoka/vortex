@@ -107,8 +107,9 @@ Every task requires a `type` field:
 | `shell`      | `exec`              | Shell command string; templated, stdout captured |
 | `spawn`      | `exe`, `args`       | Binary + args array (no shell); trigger params JSON piped to stdin and in `VORTEX_TRIGGER_PARAMS` |
 | `response`   | `template`          | Renders template, no subprocess; output becomes the workflow response |
-| `notify`     | `topic`, `message`  | Push notification via ntfy; optional `title`, `priority`, `tags`, `server`, `token` |
 | `http`       | `url`               | HTTP request; optional `method`, `headers`, `body`; success = 2xx |
+| `eval`       | `expr`              | CEL expression evaluated against `trigger.*`, `tasks.*`, `env.*`; result written to stdout; success = expression returned a truthy value |
+| `condition`  | `expr`              | CEL expression; exit 0 = true, 1 = false, 2 = eval error; stdout empty (use as a gate only, not for data) |
 | `email`      | `to`, `subject`, `body` | Send email via SMTP; requires `[email]` config section; optional `cc` |
 | `sleep`      | `duration`          | Pause execution; formats: `100ms`, `5s`, `2m` |
 | `store_set`  | `set`               | Write one or more key/value pairs to the SQLite global store; values are immediately visible as `{{globals.<key>}}` in subsequent tasks |
@@ -303,6 +304,7 @@ The DAG modal shows tasks in depth order (roots first), with their `when` expres
 | 9 — Processor endpoint | ✅ Done | `POST /process/{workflow}` synchronous endpoint; `VORTEX_TRIGGER_PARAMS` env var; homelab deployment |
 | 10 — API cleanup | ✅ Done | `POST /trigger/{workflow}` (workflow in path); `/process` → `/execute`; UDS response includes `output`; `matrix-message-handle` workflow rename |
 | 11 — Explicit types + response protocol | ✅ Done | `type =` required on all tasks; `Response` task kind; `response_template` field; `correlation_id` on workflow; `{{json}}` helper; flat JSON UDS response |
+| 12 — Eval task + CEL data extraction | ✅ Done | `eval` task type: CEL expression returning a value as stdout; `condition` kept as gate-only; `env.*` / `tasks.*` / `trigger.*` available in CEL context |
 
 ## License
 

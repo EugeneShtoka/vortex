@@ -73,7 +73,8 @@ async fn handle_line(line: &str, cfg: &NtfyListenerConfig, config: &Arc<Config>,
         return;
     };
     let run_id = Uuid::new_v4().to_string();
-    let params = message_to_params(&msg);
+    let mut params = message_to_params(&msg);
+    params.extend(cfg.params.iter().map(|(k, v)| (k.clone(), v.clone())));
     let _ = event_tx.send(Event::TriggerReceived { run_id: run_id.clone(), workflow: cfg.workflow.clone(), params: params.clone() });
     let _ = event_tx.send(Event::TriggerAccepted { run_id: run_id.clone(), workflow: cfg.workflow.clone(), params: params.clone() });
 

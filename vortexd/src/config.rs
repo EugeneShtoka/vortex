@@ -114,6 +114,8 @@ pub struct NtfyListenerConfig {
     pub workflow: String,
     pub auth_method: Option<String>,
     pub auth_key: Option<String>,
+    #[serde(default)]
+    pub params: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

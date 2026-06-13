@@ -232,7 +232,11 @@ impl Engine {
             }
             TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
             TaskKind::Spawn { exe, args } => {
-                execute_spawn(&task.id, exe, args, &self.trigger_params).await
+                let exe  = template::render(exe,  results, globals, &self.trigger_params, cid)?;
+                let args = args.iter()
+                    .map(|a| template::render(a, results, globals, &self.trigger_params, cid))
+                    .collect::<Result<Vec<_>>>()?;
+                execute_spawn(&task.id, &exe, &args, &self.trigger_params).await
             }
             TaskKind::Response { template } => {
                 let rendered = template::render(template, results, globals, &self.trigger_params, cid)?;

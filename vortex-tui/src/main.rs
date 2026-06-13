@@ -81,10 +81,9 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                if let Err(e) = ws::connect(&url, &token, tx.clone(), i).await {
-                    eprintln!("[source {i}] WS error: {e:#}");
-                }
-                let _ = tx.send((i, WsMsg::Disconnected(None))).await;
+                let err = ws::connect(&url, &token, tx.clone(), i).await.err()
+                    .map(|e| format!("{e:#}"));
+                let _ = tx.send((i, WsMsg::Disconnected(err))).await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -150,9 +149,9 @@ async fn run_loop(
                 WsMsg::AppEvent(event) => {
                     app.handle_sourced(src_idx, event);
                 }
-                WsMsg::Disconnected(_) => {
+                WsMsg::Disconnected(err) => {
                     if let Some(src) = app.sources.get_mut(src_idx) {
-                        src.connection = ConnectionStatus::Disconnected(None);
+                        src.connection = ConnectionStatus::Disconnected(err);
                     }
                 }
             }

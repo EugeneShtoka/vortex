@@ -62,6 +62,24 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_runs(f: &mut Frame, src: &SourceState, area: Rect) {
+    if let ConnectionStatus::Disconnected(Some(err)) = &src.connection {
+        if src.runs.is_empty() {
+            let block = Block::default().borders(Borders::ALL).title(" Runs ");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let lines = vec![
+                Line::from(Span::styled(" disconnected", Style::default().fg(Color::Red))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(" {err}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
+    }
+
     let items: Vec<ListItem> = src
         .runs
         .iter()
