@@ -29,8 +29,12 @@ pub fn render(f: &mut Frame, app: &App) {
         .split(outer[1]);
 
     let src = app.active_source();
-    render_runs(f, src, panes[0]);
-    render_detail(f, src, panes[1]);
+    if let ConnectionStatus::Disconnected(err) = &src.connection {
+        render_disconnected(f, err.as_deref(), outer[1]);
+    } else {
+        render_runs(f, src, panes[0]);
+        render_detail(f, src, panes[1]);
+    }
     render_statusbar(f, outer[2], src.graph.is_some());
 
     if src.show_graph {
@@ -61,28 +65,40 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn render_runs(f: &mut Frame, src: &SourceState, area: Rect) {
-    if let ConnectionStatus::Disconnected(Some(err)) = &src.connection {
-        if src.runs.is_empty() {
-            let block = Block::default().borders(Borders::ALL).title(" Runs ");
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let lines = vec![
-                Line::from(Span::styled(" disconnected", Style::default().fg(Color::Red))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!(" {err}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-            f.render_widget(Paragraph::new(lines), inner);
-            return;
-        }
+fn render_disconnected(f: &mut Frame, err: Option<&str>, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Disconnected ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = vec![
+        Line::from(Span::styled(" disconnected", Style::default().fg(Color::Red))),
+    ];
+    if let Some(msg) = err {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
+fn format_age(started_at_ms: u64) -> String {
+    if started_at_ms == 0 { return String::new(); }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let secs = now_ms.saturating_sub(started_at_ms) / 1000;
+    if secs < 60        { format!("  {}s ago", secs) }
+    else if secs < 3600 { format!("  {}m ago", secs / 60) }
+    else if secs < 86400 { format!("  {}h ago", secs / 3600) }
+    else                { format!("  {}d ago", secs / 86400) }
+}
+
+fn render_runs(f: &mut Frame, src: &SourceState, area: Rect) {
     let items: Vec<ListItem> = src
-        .runs
-        .iter()
+        .sorted_runs()
+        .into_iter()
         .map(|(_, run)| {
             let (symbol, color) = match &run.status {
                 RunStatus::Running         => ("●", Color::Yellow),
@@ -98,10 +114,12 @@ fn render_runs(f: &mut Frame, src: &SourceState, area: Rect) {
                 }
                 _ => String::new(),
             };
+            let age = format_age(run.started_at_ms);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{symbol} "), Style::default().fg(color)),
                 Span::raw(label.to_string()),
                 Span::styled(duration, Style::default().fg(Color::DarkGray)),
+                Span::styled(age, Style::default().fg(Color::DarkGray)),
             ]))
         })
         .collect();

@@ -194,8 +194,14 @@ impl SourceState {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    pub fn sorted_runs(&self) -> Vec<(&String, &RunState)> {
+        let mut runs: Vec<_> = self.runs.iter().collect();
+        runs.sort_by(|a, b| b.1.started_at_ms.cmp(&a.1.started_at_ms));
+        runs
+    }
+
     pub fn selected_run(&self) -> Option<(&String, &RunState)> {
-        self.runs.get_index(self.selected)
+        self.sorted_runs().into_iter().nth(self.selected)
     }
 }
 
