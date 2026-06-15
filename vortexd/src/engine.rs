@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::{bail, Result};
 use cel_interpreter::Value as CelValue;
@@ -206,19 +208,17 @@ impl Engine {
         results: &HashMap<String, TaskResult>,
         globals: &HashMap<String, String>,
     ) -> Result<TaskOutcome> {
-        if let TaskKind::ForEach { items, tasks, initial, accumulate } = &task.kind {
-            return self.run_foreach(items, tasks, initial, accumulate, globals, &self.correlation_id.clone()).await;
-        }
         self.dispatch_task_inner(task, results, globals, None).await
     }
 
-    async fn dispatch_task_inner(
-        &self,
-        task: &TaskConfig,
-        results: &HashMap<String, TaskResult>,
-        globals: &HashMap<String, String>,
-        item: Option<&serde_json::Value>,
-    ) -> Result<TaskOutcome> {
+    fn dispatch_task_inner<'a>(
+        &'a self,
+        task: &'a TaskConfig,
+        results: &'a HashMap<String, TaskResult>,
+        globals: &'a HashMap<String, String>,
+        item: Option<&'a serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskOutcome>> + Send + 'a>> {
+        Box::pin(async move {
         let cid = &self.correlation_id;
         let render = |tmpl: &str| -> Result<String> {
             match item {
@@ -289,8 +289,11 @@ impl Engine {
                     Err(e)    => Ok(TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
                 }
             }
-            TaskKind::ForEach { .. } => bail!("nested foreach is not supported"),
+            TaskKind::ForEach { items, tasks, initial, accumulate } => {
+                self.run_foreach(items, tasks, initial, accumulate, globals, &self.correlation_id.clone()).await
+            }
         }
+        })
     }
 
     async fn run_foreach(
@@ -1299,5 +1302,31 @@ mod tests {
         std::env::remove_var("VORTEX_TEST_ONE");
         let r = results.iter().find(|r| r.id == "loop").unwrap();
         assert!(!r.success);
+    }
+
+    #[tokio::test]
+    async fn nested_foreach_accumulates() {
+        // outer iterates [1,2], inner iterates ["a","b"] — collects 4 combos
+        std::env::set_var("VORTEX_TEST_OUTER", r#"["1","2"]"#);
+        std::env::set_var("VORTEX_TEST_INNER", r#"["a","b"]"#);
+        let inner_inner = vec![
+            TaskConfig { id: "combo".into(), kind: TaskKind::Shell { exec: "echo {{item}}".into() },
+                when: None, depends_on: None, response_template: None },
+        ];
+        let inner = vec![
+            foreach_task("inner_loop", "env.VORTEX_TEST_INNER", inner_inner, "[]",
+                "merge(acc, [tasks.combo.stdout])"),
+        ];
+        let e = engine(vec![
+            foreach_task("outer_loop", "env.VORTEX_TEST_OUTER", inner, "[]",
+                "merge(acc, tasks.inner_loop.output)"),
+        ]);
+        let results = e.run("test").await.unwrap();
+        std::env::remove_var("VORTEX_TEST_OUTER");
+        std::env::remove_var("VORTEX_TEST_INNER");
+        let r = results.iter().find(|r| r.id == "outer_loop").unwrap();
+        assert!(r.success);
+        let out: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 4);
     }
 }
