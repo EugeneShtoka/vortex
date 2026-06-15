@@ -95,6 +95,17 @@ pub enum TaskKind {
     /// Supersedes `condition` — bool expressions work identically; use this when the
     /// result value is needed downstream via `{{tasks.<id>.stdout}}` or `output`.
     Eval { expr: String },
+    /// Iterates over a CEL list, running `tasks` as a mini-pipeline for each element.
+    /// `item` is bound per-iteration in both Handlebars templates and CEL context.
+    /// `acc` starts at `initial` (CEL expr) and is updated by `accumulate` (CEL expr)
+    /// after each iteration. Final `acc` becomes this task's stdout (JSON-serialized).
+    #[serde(rename = "foreach")]
+    ForEach {
+        items:      String,
+        tasks:      Vec<TaskConfig>,
+        initial:    String,
+        accumulate: String,
+    },
 }
 
 fn default_method() -> String {
@@ -466,5 +477,60 @@ tasks = [{ id = "t", type = "shell", exec = "true" }]
     fn correlation_id_is_optional() {
         let cfg = parse_config(SAMPLE).unwrap();
         assert!(cfg.workflows["deploy"].correlation_id.is_none());
+    }
+
+    #[test]
+    fn parses_foreach_task() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[[workflows.w.tasks]]
+id         = "build_map"
+type       = "foreach"
+items      = "env.MATRIX_SPACES"
+initial    = "{}"
+accumulate = "merge(acc, toMap(tasks.fetch.output, 'state_key', item.name))"
+tasks      = [{ id = "fetch", type = "http", url = "https://example.com/{{item.id}}" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        let task = &cfg.workflows["w"].tasks[0];
+        assert_eq!(task.id, "build_map");
+        if let TaskKind::ForEach { items, tasks, initial, accumulate } = &task.kind {
+            assert_eq!(items, "env.MATRIX_SPACES");
+            assert_eq!(initial, "{}");
+            assert!(accumulate.contains("merge"));
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, "fetch");
+            assert!(matches!(tasks[0].kind, TaskKind::Http { .. }));
+        } else {
+            panic!("expected ForEach kind");
+        }
+    }
+
+    #[test]
+    fn foreach_tasks_can_have_when_and_depends_on() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[[workflows.w.tasks]]
+id         = "loop"
+type       = "foreach"
+items      = "env.LIST"
+initial    = "[]"
+accumulate = "acc"
+tasks      = [
+  { id = "a", type = "shell", exec = "echo hi" },
+  { id = "b", type = "eval",  expr = "true", when = "a", depends_on = ["a"] },
+]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        if let TaskKind::ForEach { tasks, .. } = &cfg.workflows["w"].tasks[0].kind {
+            assert_eq!(tasks[1].when.as_deref(), Some("a"));
+            assert_eq!(tasks[1].depends_on.as_ref().map(|v| v.as_slice()), Some(["a".to_string()].as_slice()));
+        } else {
+            panic!("expected ForEach kind");
+        }
     }
 }

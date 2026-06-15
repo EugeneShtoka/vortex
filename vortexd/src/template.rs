@@ -86,6 +86,56 @@ pub fn render(
     Ok(hb.render_template(template, &ctx)?)
 }
 
+/// Like `render` but injects an additional `item` value into the template context.
+/// Used by `foreach` inner tasks to access `{{item.field}}`.
+pub fn render_with_item(
+    template: &str,
+    task_results: &HashMap<String, TaskResult>,
+    globals: &HashMap<String, String>,
+    trigger_params: &HashMap<String, String>,
+    correlation_id: &str,
+    item: &serde_json::Value,
+) -> Result<String> {
+    let mut hb = Handlebars::new();
+    hb.register_escape_fn(handlebars::no_escape);
+    hb.register_helper("json", Box::new(JsonHelper));
+
+    let mut tasks = Map::new();
+    for (id, r) in task_results {
+        tasks.insert(
+            id.clone(),
+            json!({
+                "stdout":    r.stdout,
+                "stderr":    r.stderr,
+                "success":   r.success,
+                "exit_code": r.exit_code,
+                "output":    r.output,
+                "status":    r.status,
+            }),
+        );
+    }
+
+    let env: Map<String, Value> =
+        std::env::vars().map(|(k, v)| (k, Value::String(v))).collect();
+
+    let globals_val: Map<String, Value> =
+        globals.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+
+    let trigger_val: Map<String, Value> =
+        trigger_params.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+
+    let ctx = json!({
+        "tasks":          tasks,
+        "env":            env,
+        "globals":        globals_val,
+        "trigger":        trigger_val,
+        "correlation_id": correlation_id,
+        "item":           item,
+    });
+
+    Ok(hb.render_template(template, &ctx)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

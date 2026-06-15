@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
-use cel_interpreter::{Context, Program, Value};
+use cel_interpreter::{Context, ExecutionError, Program, Value};
 
 use crate::engine::TaskResult;
 
@@ -16,9 +17,10 @@ use crate::engine::TaskResult;
 /// | `tasks.<id>.stdout`          | string  | `tasks.price.stdout`                       |
 /// | `tasks.<id>.stderr`          | string  | `tasks.build.stderr`                       |
 /// | `tasks.<id>.exit_code`       | int     | `tasks.build.exit_code == 0`               |
+/// | `tasks.<id>.output`          | any     | `tasks.fetch.output.filter(e, e.ok)`       |
 /// | `trigger.<key>`              | string  | `trigger.sender == "@alice:server"`        |
 /// | `env.<KEY>`                  | any     | `trigger.sender in env.MATRIX_CONTACTS`    |
-/// | `globals.<key>`              | string  | `globals.deploy_count`                     |
+/// | `globals.<key>`              | any     | `globals.room_map['!r:s'] == 'friends'`    |
 /// | `correlation_id`             | string  | `correlation_id == "req-1"`                |
 /// | `<task_id>`                  | bool    | `build` (backward-compat bare task bools)  |
 ///
@@ -43,6 +45,52 @@ pub fn evaluate(
         Err(e) if e.to_string().contains("Undeclared reference") => Ok(false),
         Err(e) => Err(anyhow::anyhow!("Gate eval error in '{expr}': {e}")),
     }
+}
+
+/// Like `evaluate` but with additional variables injected into the CEL context.
+/// Used by `foreach` to bind `item` and `acc` per-iteration.
+pub fn evaluate_with_extras(
+    expr: &str,
+    results: &HashMap<String, TaskResult>,
+    all_ids: &[&str],
+    trigger_params: &HashMap<String, String>,
+    globals: &HashMap<String, String>,
+    correlation_id: &str,
+    extras: &[(&str, Value)],
+) -> Result<bool> {
+    let normalized = normalize(expr);
+    let program = Program::compile(&normalized)
+        .map_err(|e| anyhow::anyhow!("Gate compile error in '{expr}': {e}"))?;
+    let mut ctx = build_context(results, all_ids, trigger_params, globals, correlation_id)?;
+    for (name, val) in extras {
+        ctx.add_variable_from_value(*name, val.clone());
+    }
+    match program.execute(&ctx) {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(other) => Err(anyhow::anyhow!("Gate expression '{expr}' returned {other:?}, expected bool")),
+        Err(e) if e.to_string().contains("Undeclared reference") => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("Gate eval error in '{expr}': {e}")),
+    }
+}
+
+/// Like `evaluate_value` but with additional variables injected into the CEL context.
+pub fn evaluate_value_with_extras(
+    expr: &str,
+    results: &HashMap<String, TaskResult>,
+    all_ids: &[&str],
+    trigger_params: &HashMap<String, String>,
+    globals: &HashMap<String, String>,
+    correlation_id: &str,
+    extras: &[(&str, Value)],
+) -> Result<Value> {
+    let normalized = normalize(expr);
+    let program = Program::compile(&normalized)
+        .map_err(|e| anyhow::anyhow!("Eval compile error in '{expr}': {e}"))?;
+    let mut ctx = build_context(results, all_ids, trigger_params, globals, correlation_id)?;
+    for (name, val) in extras {
+        ctx.add_variable_from_value(*name, val.clone());
+    }
+    program.execute(&ctx).map_err(|e| anyhow::anyhow!("Eval error in '{expr}': {e}"))
 }
 
 /// Evaluate a CEL expression and return the raw value. All errors (including
@@ -72,7 +120,7 @@ fn build_context<'a>(
 ) -> Result<Context<'a>> {
     let mut ctx = Context::default();
 
-    // tasks.{id}.{success, stdout, stderr, exit_code} — all task IDs present; unrun → defaults
+    // tasks.{id}.{success, stdout, stderr, exit_code, output} — all task IDs present; unrun → defaults
     let tasks_json: serde_json::Value = {
         let mut m = serde_json::Map::new();
         for &id in all_ids {
@@ -82,12 +130,14 @@ fn build_context<'a>(
                     "stdout":    r.stdout.trim(),
                     "stderr":    r.stderr.trim(),
                     "exit_code": r.exit_code,
+                    "output":    r.output,
                 }),
                 None => serde_json::json!({
                     "success":   false,
                     "stdout":    "",
                     "stderr":    "",
                     "exit_code": -1,
+                    "output":    null,
                 }),
             };
             m.insert(id.to_string(), entry);
@@ -110,11 +160,24 @@ fn build_context<'a>(
     );
     ctx.add_variable_from_value("env", to_cel(&env_json)?);
 
-    // globals.{key}
-    ctx.add_variable_from_value("globals", to_cel(globals)?);
+    // globals.{key} — JSON-parsed where possible (same as env)
+    let globals_json: serde_json::Value = serde_json::Value::Object(
+        globals
+            .iter()
+            .map(|(k, v)| {
+                let val = serde_json::from_str(v).unwrap_or(serde_json::Value::String(v.clone()));
+                (k.clone(), val)
+            })
+            .collect(),
+    );
+    ctx.add_variable_from_value("globals", to_cel(&globals_json)?);
 
     // correlation_id
     ctx.add_variable_from_value("correlation_id", to_cel(correlation_id)?);
+
+    // Custom functions
+    ctx.add_function("toMap", cel_to_map);
+    ctx.add_function("merge", cel_merge);
 
     // backward compat: bare task-ID booleans for `when = "task_id"` style
     for &id in all_ids {
@@ -127,6 +190,61 @@ fn build_context<'a>(
     }
 
     Ok(ctx)
+}
+
+/// `toMap(list, keyField, value)` — builds `{item[keyField]: value}` for each map in `list`.
+fn cel_to_map(list: Arc<Vec<Value>>, key_field: Arc<String>, val: Arc<String>) -> Result<Value, ExecutionError> {
+    let mut obj = serde_json::Map::new();
+    for item in list.iter() {
+        if let Value::Map(m) = item {
+            for (k, v) in m.map.iter() {
+                if k.to_string() == *key_field.as_ref() {
+                    if let Value::String(s) = v {
+                        obj.insert(s.as_ref().clone(), serde_json::Value::String(val.as_ref().clone()));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    cel_interpreter::to_value(&serde_json::Value::Object(obj))
+        .map_err(|e| ExecutionError::function_error("toMap", e))
+}
+
+/// `merge(a, b)` — merges two CEL maps (b wins on conflict) or concatenates two lists.
+fn cel_merge(a: Value, b: Value) -> Result<Value, ExecutionError> {
+    match (a, b) {
+        (Value::Map(m1), Value::Map(m2)) => {
+            let mut merged: serde_json::Map<String, serde_json::Value> =
+                m1.map.iter().map(|(k, v)| (k.to_string(), cel_val_to_json(v))).collect();
+            merged.extend(m2.map.iter().map(|(k, v)| (k.to_string(), cel_val_to_json(v))));
+            cel_interpreter::to_value(&serde_json::Value::Object(merged))
+                .map_err(|e| ExecutionError::function_error("merge", e))
+        }
+        (Value::List(l1), Value::List(l2)) => {
+            let combined: Vec<serde_json::Value> =
+                l1.iter().chain(l2.iter()).map(cel_val_to_json).collect();
+            cel_interpreter::to_value(&serde_json::Value::Array(combined))
+                .map_err(|e| ExecutionError::function_error("merge", e))
+        }
+        _ => Err(ExecutionError::function_error("merge", "arguments must both be maps or both be lists")),
+    }
+}
+
+fn cel_val_to_json(val: &Value) -> serde_json::Value {
+    match val {
+        Value::Int(i)    => serde_json::Value::Number((*i).into()),
+        Value::UInt(u)   => serde_json::Value::Number((*u).into()),
+        Value::Float(f)  => serde_json::json!(*f),
+        Value::String(s) => serde_json::Value::String(s.as_ref().clone()),
+        Value::Bool(b)   => serde_json::Value::Bool(*b),
+        Value::Null      => serde_json::Value::Null,
+        Value::List(l)   => serde_json::Value::Array(l.iter().map(cel_val_to_json).collect()),
+        Value::Map(m)    => serde_json::Value::Object(
+            m.map.iter().map(|(k, v)| (k.to_string(), cel_val_to_json(v))).collect()
+        ),
+        _ => serde_json::Value::Null,
+    }
 }
 
 fn to_cel<T: serde::Serialize + ?Sized>(v: &T) -> Result<Value> {
@@ -265,6 +383,122 @@ mod tests {
         let mut globals = HashMap::new();
         globals.insert("mode".into(), "active".into());
         assert!(evaluate("globals.mode == \"active\"", &HashMap::new(), &[], &HashMap::new(), &globals, "").unwrap());
+    }
+
+    // --- tasks.*.output (Bug 1 fix) ---
+
+    #[test]
+    fn tasks_output_map_accessible() {
+        let mut rs = results(&[("fetch", true)]);
+        rs.get_mut("fetch").unwrap().output = Some(serde_json::json!({"code": 200, "body": "ok"}));
+        assert!(evaluate("tasks.fetch.output.code == 200", &rs, &["fetch"], &HashMap::new(), &HashMap::new(), "").unwrap());
+    }
+
+    #[test]
+    fn tasks_output_list_size() {
+        let mut rs = results(&[("fetch", true)]);
+        rs.get_mut("fetch").unwrap().output = Some(serde_json::json!([
+            {"type": "m.space.child", "state_key": "!room1:s"},
+            {"type": "m.room.member", "state_key": "@alice:s"},
+        ]));
+        assert!(evaluate("tasks.fetch.output.size() == 2", &rs, &["fetch"], &HashMap::new(), &HashMap::new(), "").unwrap());
+    }
+
+    #[test]
+    fn tasks_output_null_when_unset() {
+        let rs = results(&[("fetch", true)]);
+        assert!(evaluate("tasks.fetch.output == null", &rs, &["fetch"], &HashMap::new(), &HashMap::new(), "").unwrap());
+    }
+
+    // --- globals JSON-parsed ---
+
+    #[test]
+    fn globals_json_list_membership() {
+        let mut globals = HashMap::new();
+        globals.insert("rooms".into(), r#"["!room1:server","!room2:server"]"#.into());
+        assert!(evaluate(r#"'!room1:server' in globals.rooms"#, &HashMap::new(), &[], &HashMap::new(), &globals, "").unwrap());
+        assert!(!evaluate(r#"'!unknown:server' in globals.rooms"#, &HashMap::new(), &[], &HashMap::new(), &globals, "").unwrap());
+    }
+
+    #[test]
+    fn globals_json_map_index() {
+        let mut globals = HashMap::new();
+        globals.insert("space_map".into(), r#"{"!room1:server":"friends","!room2:server":"work"}"#.into());
+        assert!(evaluate(r#"globals.space_map['!room1:server'] == 'friends'"#, &HashMap::new(), &[], &HashMap::new(), &globals, "").unwrap());
+    }
+
+    // --- toMap custom function ---
+
+    #[test]
+    fn to_map_builds_reverse_map() {
+        let mut rs = results(&[("fetch", true)]);
+        rs.get_mut("fetch").unwrap().output = Some(serde_json::json!([
+            {"type": "m.space.child", "state_key": "!room1:s"},
+            {"type": "m.space.child", "state_key": "!room2:s"},
+            {"type": "m.room.member", "state_key": "@alice:s"},
+        ]));
+        assert!(evaluate(
+            r#"toMap(tasks.fetch.output.filter(e, e.type == 'm.space.child'), 'state_key', 'friends')['!room1:s'] == 'friends'"#,
+            &rs, &["fetch"], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn to_map_empty_list_gives_empty_map() {
+        assert!(evaluate(
+            "toMap([], 'key', 'val').size() == 0",
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    // --- merge custom function ---
+
+    #[test]
+    fn merge_combines_two_maps() {
+        assert!(evaluate(
+            r#"merge({'a': '1'}, {'b': '2'})['a'] == '1' && merge({'a': '1'}, {'b': '2'})['b'] == '2'"#,
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn merge_second_wins_on_conflict() {
+        assert!(evaluate(
+            r#"merge({'a': 'old'}, {'a': 'new'})['a'] == 'new'"#,
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn merge_with_empty_map() {
+        assert!(evaluate(
+            r#"merge({}, {'a': '1'})['a'] == '1'"#,
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn merge_concatenates_two_lists() {
+        assert!(evaluate(
+            "merge(['a', 'b'], ['c']).size() == 3",
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn merge_list_preserves_order() {
+        assert!(evaluate(
+            "merge(['x'], ['y'])[0] == 'x' && merge(['x'], ['y'])[1] == 'y'",
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
+    }
+
+    #[test]
+    fn merge_empty_list_with_list() {
+        assert!(evaluate(
+            "merge([], ['a'])[0] == 'a'",
+            &HashMap::new(), &[], &HashMap::new(), &HashMap::new(), ""
+        ).unwrap());
     }
 
     // --- combined ---

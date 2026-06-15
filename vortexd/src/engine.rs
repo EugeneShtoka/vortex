@@ -206,40 +206,61 @@ impl Engine {
         results: &HashMap<String, TaskResult>,
         globals: &HashMap<String, String>,
     ) -> Result<TaskOutcome> {
+        if let TaskKind::ForEach { items, tasks, initial, accumulate } = &task.kind {
+            return self.run_foreach(items, tasks, initial, accumulate, globals, &self.correlation_id.clone()).await;
+        }
+        self.dispatch_task_inner(task, results, globals, None).await
+    }
+
+    async fn dispatch_task_inner(
+        &self,
+        task: &TaskConfig,
+        results: &HashMap<String, TaskResult>,
+        globals: &HashMap<String, String>,
+        item: Option<&serde_json::Value>,
+    ) -> Result<TaskOutcome> {
         let cid = &self.correlation_id;
+        let render = |tmpl: &str| -> Result<String> {
+            match item {
+                Some(it) => template::render_with_item(tmpl, results, globals, &self.trigger_params, cid, it),
+                None     => template::render(tmpl, results, globals, &self.trigger_params, cid),
+            }
+        };
         match &task.kind {
             TaskKind::Shell { exec } => {
-                let cmd = template::render(exec, results, globals, &self.trigger_params, cid)?;
+                let cmd = render(exec)?;
                 execute_shell(&task.id, &cmd, &self.trigger_params).await
             }
             TaskKind::Http { url, method, headers, body } => {
-                let url  = template::render(url, results, globals, &self.trigger_params, cid)?;
-                let body = body.as_ref().map(|b| template::render(b, results, globals, &self.trigger_params, cid)).transpose()?;
-                let hdrs = render_map(headers, results, globals, &self.trigger_params, cid)?;
+                let url  = render(url)?;
+                let body = body.as_ref().map(|b| render(b)).transpose()?;
+                let hdrs: HashMap<String, String> = headers.iter()
+                    .map(|(k, v)| render(v).map(|v| (k.clone(), v)))
+                    .collect::<Result<_>>()?;
                 execute_http(method, &url, &hdrs, body.as_deref()).await
             }
             TaskKind::Email { to, subject, body, cc } => {
-                let subject = template::render(subject, results, globals, &self.trigger_params, cid)?;
-                let body    = template::render(body, results, globals, &self.trigger_params, cid)?;
+                let subject = render(subject)?;
+                let body    = render(body)?;
                 let cfg = self.email_config.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Email task requires [email] config section"))?;
                 execute_email(to, &subject, &body, cc.as_deref(), cfg).await
             }
             TaskKind::Sleep { duration } => execute_sleep(duration).await,
             TaskKind::StoreSet { set } => {
-                let rendered = render_map(set, results, globals, &self.trigger_params, cid)?;
+                let rendered: HashMap<String, String> = set.iter()
+                    .map(|(k, v)| render(v).map(|v| (k.clone(), v)))
+                    .collect::<Result<_>>()?;
                 execute_store_set(rendered, &self.db_path).await
             }
             TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
             TaskKind::Spawn { exe, args } => {
-                let exe  = template::render(exe,  results, globals, &self.trigger_params, cid)?;
-                let args = args.iter()
-                    .map(|a| template::render(a, results, globals, &self.trigger_params, cid))
-                    .collect::<Result<Vec<_>>>()?;
+                let exe  = render(exe)?;
+                let args = args.iter().map(|a| render(a)).collect::<Result<Vec<_>>>()?;
                 execute_spawn(&task.id, &exe, &args, &self.trigger_params).await
             }
             TaskKind::Response { template } => {
-                let rendered = template::render(template, results, globals, &self.trigger_params, cid)?;
+                let rendered = render(template)?;
                 Ok(TaskOutcome {
                     stdout: rendered, stderr: String::new(),
                     exit_code: 0, success: true, output: None, status: None,
@@ -247,7 +268,11 @@ impl Engine {
             }
             TaskKind::Condition { expr } => {
                 let all_ids: Vec<&str> = results.keys().map(String::as_str).collect();
-                match gate::evaluate(expr, results, &all_ids, &self.trigger_params, globals, cid) {
+                let extras: Vec<(&str, cel_interpreter::Value)> = item
+                    .and_then(|it| cel_interpreter::to_value(it).ok())
+                    .map(|v| vec![("item", v)])
+                    .unwrap_or_default();
+                match gate::evaluate_with_extras(expr, results, &all_ids, &self.trigger_params, globals, cid, &extras) {
                     Ok(true)  => Ok(TaskOutcome { stdout: "true".into(),  stderr: String::new(), exit_code: 0, success: true,  output: None, status: None }),
                     Ok(false) => Ok(TaskOutcome { stdout: "false".into(), stderr: String::new(), exit_code: 1, success: false, output: None, status: None }),
                     Err(e)    => Ok(TaskOutcome { stdout: String::new(),  stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
@@ -255,12 +280,99 @@ impl Engine {
             }
             TaskKind::Eval { expr } => {
                 let all_ids: Vec<&str> = results.keys().map(String::as_str).collect();
-                match gate::evaluate_value(expr, results, &all_ids, &self.trigger_params, globals, cid) {
+                let extras: Vec<(&str, cel_interpreter::Value)> = item
+                    .and_then(|it| cel_interpreter::to_value(it).ok())
+                    .map(|v| vec![("item", v)])
+                    .unwrap_or_default();
+                match gate::evaluate_value_with_extras(expr, results, &all_ids, &self.trigger_params, globals, cid, &extras) {
                     Ok(value) => Ok(cel_to_outcome(value)),
                     Err(e)    => Ok(TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
                 }
             }
+            TaskKind::ForEach { .. } => bail!("nested foreach is not supported"),
         }
+    }
+
+    async fn run_foreach(
+        &self,
+        items_expr: &str,
+        inner_tasks: &[TaskConfig],
+        initial_expr: &str,
+        accumulate_expr: &str,
+        globals: &HashMap<String, String>,
+        cid: &str,
+    ) -> Result<TaskOutcome> {
+        // Evaluate `items` to get the iteration list
+        let empty_results = HashMap::new();
+        let all_ids: Vec<&str> = vec![];
+        let items_val = gate::evaluate_value(items_expr, &empty_results, &all_ids, &self.trigger_params, globals, cid)
+            .map_err(|e| anyhow::anyhow!("foreach items eval error: {e}"))?;
+        let CelValue::List(items) = items_val else {
+            bail!("foreach `items` expression must evaluate to a list");
+        };
+
+        // Evaluate `initial` to seed the accumulator
+        let mut acc = gate::evaluate_value(initial_expr, &empty_results, &all_ids, &self.trigger_params, globals, cid)
+            .map_err(|e| anyhow::anyhow!("foreach initial eval error: {e}"))?;
+
+        for item in items.iter() {
+            // Run inner pipeline with `item` injected
+            let inner_results = self.run_foreach_iteration(item, inner_tasks, globals, cid).await?;
+
+            // Evaluate accumulate with `acc` and `item` in context
+            let all_inner_ids: Vec<&str> = inner_results.keys().map(String::as_str).collect();
+            let new_acc = gate::evaluate_value_with_extras(
+                accumulate_expr, &inner_results, &all_inner_ids,
+                &self.trigger_params, globals, cid,
+                &[("acc", acc.clone()), ("item", item.clone())],
+            ).map_err(|e| anyhow::anyhow!("foreach accumulate eval error: {e}"))?;
+            acc = new_acc;
+        }
+
+        Ok(cel_to_outcome(acc))
+    }
+
+    async fn run_foreach_iteration(
+        &self,
+        item: &CelValue,
+        inner_tasks: &[TaskConfig],
+        globals: &HashMap<String, String>,
+        cid: &str,
+    ) -> Result<HashMap<String, TaskResult>> {
+        let item_json = cel_to_json(item);
+        let cel_item  = item.clone();
+        let mut results: HashMap<String, TaskResult> = HashMap::new();
+        let all_ids: Vec<&str> = inner_tasks.iter().map(|t| t.id.as_str()).collect();
+
+        for task in inner_tasks {
+            let allowed = if let Some(expr) = &task.when {
+                gate::evaluate_with_extras(expr, &results, &all_ids, &self.trigger_params, globals, cid,
+                    &[("item", cel_item.clone())])?
+            } else { true };
+            if !allowed {
+                results.insert(task.id.clone(), TaskResult {
+                    id: task.id.clone(), stdout: String::new(), stderr: String::new(),
+                    exit_code: 1, success: false, output: None, status: None, response: None,
+                });
+                continue;
+            }
+            let outcome = self.dispatch_task_inner(task, &results, globals, Some(&item_json)).await
+                .unwrap_or_else(|e| TaskOutcome {
+                    stdout: String::new(), stderr: e.to_string(),
+                    exit_code: -1, success: false, output: None, status: None,
+                });
+            let success = outcome.success;
+            results.insert(task.id.clone(), TaskResult {
+                id: task.id.clone(),
+                stdout: outcome.stdout, stderr: outcome.stderr,
+                exit_code: outcome.exit_code, success: outcome.success,
+                output: outcome.output, status: outcome.status, response: None,
+            });
+            if !success {
+                bail!("foreach inner task '{}' failed", task.id);
+            }
+        }
+        Ok(results)
     }
 
     fn gate_allows(
@@ -1103,5 +1215,89 @@ mod tests {
         let results = e.run("test").await.unwrap();
         assert!( results.iter().any(|r| r.id == "on_even"  && r.success));
         assert!(!results.iter().any(|r| r.id == "on_other"));
+    }
+
+    // --- ForEach task ---
+
+    fn foreach_task(id: &str, items: &str, inner: Vec<TaskConfig>, initial: &str, accumulate: &str) -> TaskConfig {
+        TaskConfig {
+            id: id.into(),
+            kind: TaskKind::ForEach {
+                items: items.into(),
+                tasks: inner,
+                initial: initial.into(),
+                accumulate: accumulate.into(),
+            },
+            when: None, depends_on: None, response_template: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn foreach_accumulates_over_list() {
+        std::env::set_var("VORTEX_TEST_ITEMS", r#"["a","b","c"]"#);
+        let inner = vec![
+            TaskConfig { id: "echo".into(), kind: TaskKind::Shell { exec: "echo {{item}}".into() },
+                when: None, depends_on: None, response_template: None },
+        ];
+        let e = engine(vec![
+            foreach_task("loop", "env.VORTEX_TEST_ITEMS", inner, "[]",
+                "acc + [tasks.echo.stdout]"),
+        ]);
+        let results = e.run("test").await.unwrap();
+        std::env::remove_var("VORTEX_TEST_ITEMS");
+        let r = results.iter().find(|r| r.id == "loop").unwrap();
+        assert!(r.success);
+        let out: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn foreach_item_field_available_in_template() {
+        std::env::set_var("VORTEX_TEST_SPACES", r#"[{"id":"s1","name":"friends"},{"id":"s2","name":"work"}]"#);
+        let inner = vec![
+            TaskConfig { id: "label".into(), kind: TaskKind::Shell { exec: "echo {{item.name}}".into() },
+                when: None, depends_on: None, response_template: None },
+        ];
+        let e = engine(vec![
+            foreach_task("loop", "env.VORTEX_TEST_SPACES", inner, "{}",
+                r#"merge(acc, {tasks.label.stdout: item.name})"#),
+        ]);
+        let results = e.run("test").await.unwrap();
+        std::env::remove_var("VORTEX_TEST_SPACES");
+        let r = results.iter().find(|r| r.id == "loop").unwrap();
+        assert!(r.success);
+    }
+
+    #[tokio::test]
+    async fn foreach_empty_list_returns_initial() {
+        std::env::set_var("VORTEX_TEST_EMPTY", "[]");
+        let inner = vec![
+            TaskConfig { id: "t".into(), kind: TaskKind::Shell { exec: "echo hi".into() },
+                when: None, depends_on: None, response_template: None },
+        ];
+        let e = engine(vec![
+            foreach_task("loop", "env.VORTEX_TEST_EMPTY", inner, "\"done\"", "acc"),
+        ]);
+        let results = e.run("test").await.unwrap();
+        std::env::remove_var("VORTEX_TEST_EMPTY");
+        let r = results.iter().find(|r| r.id == "loop").unwrap();
+        assert!(r.success);
+        assert_eq!(r.stdout.trim(), "done");
+    }
+
+    #[tokio::test]
+    async fn foreach_inner_task_failure_fails_foreach() {
+        std::env::set_var("VORTEX_TEST_ONE", r#"["x"]"#);
+        let inner = vec![
+            TaskConfig { id: "fail".into(), kind: TaskKind::Shell { exec: "exit 1".into() },
+                when: None, depends_on: None, response_template: None },
+        ];
+        let e = engine(vec![
+            foreach_task("loop", "env.VORTEX_TEST_ONE", inner, "{}", "acc"),
+        ]);
+        let results = e.run("test").await.unwrap();
+        std::env::remove_var("VORTEX_TEST_ONE");
+        let r = results.iter().find(|r| r.id == "loop").unwrap();
+        assert!(!r.success);
     }
 }
