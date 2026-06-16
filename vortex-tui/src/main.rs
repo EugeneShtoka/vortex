@@ -24,7 +24,7 @@ use graph::{DependencyGraph, WorkflowConfigDto};
 use ws::WsMsg;
 
 #[derive(Parser)]
-#[command(name = "vortex-tui", about = "Live observer for running vortexd instances")]
+#[command(name = "vortex-tui", version, about = "Live observer for running vortexd instances")]
 struct Cli {
     #[arg(long, help = "WebSocket URL — creates a single source (overrides vortex.toml)")]
     url: Option<String>,
@@ -123,15 +123,18 @@ async fn run_loop(
     cfg: &TuiConfig,
 ) -> Result<()> {
     let tick = Duration::from_millis(100);
-    // Track last-known (active_source_idx, selected_run_idx) to detect changes
+    // Track (active_source_idx, selected_workflow_idx) to detect selection changes
     let mut last_graph_key: Option<(usize, usize)> = None;
 
     // Load graph for initial selection of the active source
-    if let Some((_, run)) = app.selected_run() {
-        let src = &cfg.sources[app.active];
-        let workflow = run.workflow.clone();
-        if let Some(g) = fetch_graph(&src.http_base, &src.token, &workflow).await {
-            app.set_graph(g);
+    {
+        let src_state = app.active_source();
+        let workflow = src_state.workflow_names().into_iter().next();
+        if let Some(wf) = workflow {
+            let src = &cfg.sources[app.active];
+            if let Some(g) = fetch_graph(&src.http_base, &src.token, &wf).await {
+                app.set_graph(g);
+            }
         }
     }
 
@@ -159,33 +162,59 @@ async fn run_loop(
 
         if event::poll(tick)? {
             if let CrosstermEvent::Key(key) = event::read()? {
+                use app::Focus;
+                let in_detail = app.active_source().focus == Focus::TaskDetail;
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q') | KeyCode::Char('Q'), _) => break,
-                    (KeyCode::Char('g') | KeyCode::Char('G'), _) => app.toggle_graph(),
+                    (KeyCode::Char('g') | KeyCode::Char('G'), _) if !in_detail => {
+                        app.toggle_graph();
+                    }
                     (KeyCode::Tab, KeyModifiers::SHIFT) => app.prev_source(),
                     (KeyCode::Tab, _) => app.next_source(),
                     (KeyCode::Down | KeyCode::Char('j'), _) => {
                         app.active_source_mut().show_graph = false;
-                        app.select_next();
+                        app.navigate_down();
                     }
                     (KeyCode::Up | KeyCode::Char('k'), _) => {
                         app.active_source_mut().show_graph = false;
-                        app.select_prev();
+                        app.navigate_up();
+                    }
+                    (KeyCode::Right | KeyCode::Char('l'), _) => {
+                        app.active_source_mut().show_graph = false;
+                        app.focus_right();
+                    }
+                    (KeyCode::Left | KeyCode::Char('h'), _) => {
+                        app.active_source_mut().show_graph = false;
+                        app.focus_left();
+                    }
+                    (KeyCode::Enter, _) => {
+                        app.active_source_mut().show_graph = false;
+                        app.enter_pane();
+                    }
+                    (KeyCode::Esc, _) => {
+                        if app.active_source().show_graph {
+                            app.active_source_mut().show_graph = false;
+                        } else {
+                            app.escape_pane();
+                        }
                     }
                     _ => {}
                 }
             }
         }
 
-        // Fetch workflow graph when (active source, selected run) changes
-        let current_key = Some((app.active, app.active_source().selected));
+        // Fetch workflow graph when (active source, selected workflow) changes
+        let current_key = Some((app.active, app.active_source().selected_workflow));
         if last_graph_key != current_key {
             last_graph_key = current_key;
-            if let Some((_, run)) = app.selected_run() {
-                let workflow = run.workflow.clone();
-                if !workflow.is_empty() {
+            let workflow = app.active_source()
+                .workflow_names()
+                .into_iter()
+                .nth(app.active_source().selected_workflow);
+            if let Some(wf) = workflow {
+                if !wf.is_empty() {
                     let src = &cfg.sources[app.active];
-                    if let Some(g) = fetch_graph(&src.http_base, &src.token, &workflow).await {
+                    if let Some(g) = fetch_graph(&src.http_base, &src.token, &wf).await {
                         app.set_graph(g);
                     }
                 }

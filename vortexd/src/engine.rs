@@ -150,7 +150,20 @@ impl Engine {
             }
 
             results.insert(result.id.clone(), result.clone());
+
+            let should_abort = if let Some(expr) = &task.abort_if {
+                let all_ids_here: Vec<&str> = results.keys().map(String::as_str).collect();
+                match gate::task_result_to_cel(&result).and_then(|self_val| {
+                    gate::evaluate_with_extras(expr, &results, &all_ids_here, &self.trigger_params, &globals, &self.correlation_id, &[("self", self_val)])
+                }) {
+                    Ok(true)  => { info!(task = %task.id, "abort_if triggered — stopping workflow early"); true }
+                    Ok(false) => false,
+                    Err(e)    => { warn!(task = %task.id, "abort_if eval error: {e:#}"); false }
+                }
+            } else { false };
+
             all_results.push(result);
+            if should_abort { break; }
         }
 
         let overall_success = all_results.iter().all(|r| r.success);
@@ -618,7 +631,7 @@ mod tests {
     use crate::event::Event;
 
     fn task(id: &str, exec: &str, when: Option<&str>) -> TaskConfig {
-        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string), depends_on: None, response_template: None }
+        TaskConfig { id: id.into(), kind: TaskKind::Shell { exec: exec.into() }, when: when.map(str::to_string), depends_on: None, response_template: None, abort_if: None }
     }
 
     fn workflow(tasks: Vec<TaskConfig>) -> WorkflowConfig {
@@ -892,7 +905,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "wait".into(),
             kind: TaskKind::Sleep { duration: "10ms".into() },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -904,8 +917,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("v.db").to_string_lossy().into_owned();
         let wf = workflow(vec![
-            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, depends_on: None, response_template: None },
-            TaskConfig { id: "use".into(),  kind: TaskKind::Shell { exec: "echo {{globals.mykey}}".into() }, when: Some("save".into()), depends_on: None, response_template: None },
+            TaskConfig { id: "save".into(), kind: TaskKind::StoreSet { set: [("mykey".into(), "hello".into())].into() }, when: None, depends_on: None, response_template: None, abort_if: None },
+            TaskConfig { id: "use".into(),  kind: TaskKind::Shell { exec: "echo {{globals.mykey}}".into() }, when: Some("save".into()), depends_on: None, response_template: None, abort_if: None },
         ]);
         let e = Engine::new(wf, &db);
         let results = e.run("test").await.unwrap();
@@ -933,7 +946,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "greet".into(),
             kind: TaskKind::Spawn { exe: "echo".into(), args: vec!["hello".into(), "world".into()] },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
@@ -946,7 +959,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "ok".into(),
             kind: TaskKind::Spawn { exe: "true".into(), args: vec![] },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -958,7 +971,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "fail".into(),
             kind: TaskKind::Spawn { exe: "false".into(), args: vec![] },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(!results[0].success);
@@ -971,7 +984,7 @@ mod tests {
         let e = engine(vec![TaskConfig {
             id: "echo_params".into(),
             kind: TaskKind::Spawn { exe: "cat".into(), args: vec![] },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }]).with_params(HashMap::from([("Body".into(), "hello".into()), ("Sender".into(), "@user".into())]));
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -983,8 +996,8 @@ mod tests {
     #[tokio::test]
     async fn spawn_task_gates_on_exit_code() {
         let e = engine(vec![
-            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None, depends_on: None, response_template: None },
-            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), depends_on: None, response_template: None },
+            TaskConfig { id: "filter".into(), kind: TaskKind::Spawn { exe: "false".into(), args: vec![] }, when: None, depends_on: None, response_template: None, abort_if: None },
+            TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), depends_on: None, response_template: None, abort_if: None },
         ]);
         let results = e.run("test").await.unwrap();
         assert!(results.iter().any(|r| r.id == "filter" && !r.success));
@@ -1003,6 +1016,7 @@ mod tests {
                 when: Some("hello".into()),
                 depends_on: None,
                 response_template: None,
+                abort_if: None,
             },
         ]);
         let results = e.run("test").await.unwrap();
@@ -1019,6 +1033,7 @@ mod tests {
             when: None,
             depends_on: None,
             response_template: None,
+            abort_if: None,
         }]).with_params(HashMap::from([("text".into(), "hello".into())]));
         let results = e.run("test").await.unwrap();
         assert_eq!(results[0].stdout.trim(), "msg=hello");
@@ -1032,6 +1047,7 @@ mod tests {
             when: None,
             depends_on: None,
             response_template: None,
+            abort_if: None,
         }]).with_correlation_id("req-99".into());
         let results = e.run("test").await.unwrap();
         assert_eq!(results[0].stdout.trim(), "id=req-99");
@@ -1047,6 +1063,7 @@ mod tests {
             when: None,
             depends_on: None,
             response_template: Some("wrapped={{tasks.t.stdout}}".into()),
+            abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(results[0].success);
@@ -1061,6 +1078,7 @@ mod tests {
             when: None,
             depends_on: None,
             response_template: Some("should_not_appear".into()),
+            abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         assert!(!results[0].success);
@@ -1075,16 +1093,51 @@ mod tests {
             when: None,
             depends_on: None,
             response_template: Some(r#"{"out":"{{tasks.t.stdout}}"}"#.into()),
+            abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
         let resp = results[0].response.as_deref().unwrap();
         assert!(resp.contains("hello"));
     }
 
+    // --- abort_if ---
+
+    #[tokio::test]
+    async fn abort_if_stops_workflow_on_success() {
+        let mut check = task("check", "true", None);
+        check.abort_if = Some("self.success".into());
+        let e = engine(vec![check, task("work", "echo should_not_run", Some("check"))]);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 1, "only check ran");
+        assert!(results[0].success);
+        assert_eq!(results[0].id, "check");
+    }
+
+    #[tokio::test]
+    async fn abort_if_false_does_not_stop_workflow() {
+        let mut check = task("check", "false", None);
+        check.abort_if = Some("self.success".into());
+        // check fails → abort_if = false → work is gated on "check" which failed → skipped
+        let e = engine(vec![check, task("work", "echo done", Some("check"))]);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 1, "check ran; work skipped by gate");
+        assert_eq!(results[0].id, "check");
+    }
+
+    #[tokio::test]
+    async fn abort_if_can_reference_stdout() {
+        let mut probe = task("probe", "echo stop", None);
+        probe.abort_if = Some(r#"self.stdout == "stop""#.into());
+        let e = engine(vec![probe, task("next", "echo after", None)]);
+        let results = e.run("test").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "probe");
+    }
+
     // --- Eval task ---
 
     fn eval(id: &str, expr: &str) -> TaskConfig {
-        TaskConfig { id: id.into(), kind: TaskKind::Eval { expr: expr.into() }, when: None, depends_on: None, response_template: None }
+        TaskConfig { id: id.into(), kind: TaskKind::Eval { expr: expr.into() }, when: None, depends_on: None, response_template: None, abort_if: None }
     }
 
     #[tokio::test]
@@ -1169,7 +1222,7 @@ mod tests {
     // --- Condition task ---
 
     fn condition(id: &str, expr: &str) -> TaskConfig {
-        TaskConfig { id: id.into(), kind: TaskKind::Condition { expr: expr.into() }, when: None, depends_on: None, response_template: None }
+        TaskConfig { id: id.into(), kind: TaskKind::Condition { expr: expr.into() }, when: None, depends_on: None, response_template: None, abort_if: None }
     }
 
     #[tokio::test]
@@ -1231,7 +1284,7 @@ mod tests {
                 initial: initial.into(),
                 accumulate: accumulate.into(),
             },
-            when: None, depends_on: None, response_template: None,
+            when: None, depends_on: None, response_template: None, abort_if: None,
         }
     }
 
@@ -1240,7 +1293,7 @@ mod tests {
         std::env::set_var("VORTEX_TEST_ITEMS", r#"["a","b","c"]"#);
         let inner = vec![
             TaskConfig { id: "echo".into(), kind: TaskKind::Shell { exec: "echo {{item}}".into() },
-                when: None, depends_on: None, response_template: None },
+                when: None, depends_on: None, response_template: None, abort_if: None },
         ];
         let e = engine(vec![
             foreach_task("loop", "env.VORTEX_TEST_ITEMS", inner, "[]",
@@ -1259,7 +1312,7 @@ mod tests {
         std::env::set_var("VORTEX_TEST_SPACES", r#"[{"id":"s1","name":"friends"},{"id":"s2","name":"work"}]"#);
         let inner = vec![
             TaskConfig { id: "label".into(), kind: TaskKind::Shell { exec: "echo {{item.name}}".into() },
-                when: None, depends_on: None, response_template: None },
+                when: None, depends_on: None, response_template: None, abort_if: None },
         ];
         let e = engine(vec![
             foreach_task("loop", "env.VORTEX_TEST_SPACES", inner, "{}",
@@ -1276,7 +1329,7 @@ mod tests {
         std::env::set_var("VORTEX_TEST_EMPTY", "[]");
         let inner = vec![
             TaskConfig { id: "t".into(), kind: TaskKind::Shell { exec: "echo hi".into() },
-                when: None, depends_on: None, response_template: None },
+                when: None, depends_on: None, response_template: None, abort_if: None },
         ];
         let e = engine(vec![
             foreach_task("loop", "env.VORTEX_TEST_EMPTY", inner, "\"done\"", "acc"),
@@ -1293,7 +1346,7 @@ mod tests {
         std::env::set_var("VORTEX_TEST_ONE", r#"["x"]"#);
         let inner = vec![
             TaskConfig { id: "fail".into(), kind: TaskKind::Shell { exec: "exit 1".into() },
-                when: None, depends_on: None, response_template: None },
+                when: None, depends_on: None, response_template: None, abort_if: None },
         ];
         let e = engine(vec![
             foreach_task("loop", "env.VORTEX_TEST_ONE", inner, "{}", "acc"),
@@ -1311,7 +1364,7 @@ mod tests {
         std::env::set_var("VORTEX_TEST_INNER", r#"["a","b"]"#);
         let inner_inner = vec![
             TaskConfig { id: "combo".into(), kind: TaskKind::Shell { exec: "echo {{item}}".into() },
-                when: None, depends_on: None, response_template: None },
+                when: None, depends_on: None, response_template: None, abort_if: None },
         ];
         let inner = vec![
             foreach_task("inner_loop", "env.VORTEX_TEST_INNER", inner_inner, "[]",

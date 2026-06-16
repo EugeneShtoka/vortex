@@ -66,12 +66,24 @@ pub enum ConnectionStatus {
     Disconnected(Option<String>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Focus {
+    Workflows,
+    Runs,
+    Tasks,
+    TaskDetail,
+}
+
 /// Per-daemon state: runs, selection, graph modal, connection status.
 pub struct SourceState {
     pub name: String,
     pub connection: ConnectionStatus,
     pub runs: IndexMap<String, RunState>,
     pub selected: usize,
+    pub selected_workflow: usize,
+    pub selected_task: usize,
+    pub task_scroll: usize,
+    pub focus: Focus,
     pub graph: Option<DependencyGraph>,
     pub show_graph: bool,
 }
@@ -83,6 +95,10 @@ impl SourceState {
             connection: ConnectionStatus::Connecting,
             runs: IndexMap::new(),
             selected: 0,
+            selected_workflow: 0,
+            selected_task: 0,
+            task_scroll: 0,
+            focus: Focus::Workflows,
             graph: None,
             show_graph: false,
         }
@@ -133,6 +149,7 @@ impl SourceState {
             }
             _ => {}
         }
+        self.clamp_selections();
     }
 
     /// Populate a run from a REST API response. Upserts — existing live runs are updated.
@@ -171,6 +188,7 @@ impl SourceState {
             started_at_ms: detail.summary.started_at,
             finished_at_ms: detail.summary.finished_at,
         });
+        self.clamp_selections();
     }
 
     pub fn set_graph(&mut self, graph: DependencyGraph) {
@@ -202,6 +220,186 @@ impl SourceState {
 
     pub fn selected_run(&self) -> Option<(&String, &RunState)> {
         self.sorted_runs().into_iter().nth(self.selected)
+    }
+
+    /// Deduplicated workflow names, ordered by most-recent run first.
+    pub fn workflow_names(&self) -> Vec<String> {
+        let mut runs: Vec<_> = self.runs.values().collect();
+        runs.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
+        let mut seen = std::collections::HashSet::new();
+        let mut names = vec![];
+        for run in runs {
+            if !run.workflow.is_empty() && seen.insert(run.workflow.clone()) {
+                names.push(run.workflow.clone());
+            }
+        }
+        names
+    }
+
+    /// Runs filtered to the currently selected workflow, newest first.
+    pub fn runs_for_selected_workflow(&self) -> Vec<(&String, &RunState)> {
+        let names = self.workflow_names();
+        let workflow = names.get(self.selected_workflow);
+        let mut runs: Vec<_> = self.runs.iter()
+            .filter(|(_, r)| workflow.map(|w| w == &r.workflow).unwrap_or(false))
+            .collect();
+        runs.sort_by(|a, b| b.1.started_at_ms.cmp(&a.1.started_at_ms));
+        runs
+    }
+
+    /// Selected run within the filtered workflow list.
+    pub fn selected_run_in_workflow(&self) -> Option<(&String, &RunState)> {
+        self.runs_for_selected_workflow().into_iter().nth(self.selected)
+    }
+
+    /// The task currently highlighted in the tasks pane.
+    pub fn selected_task_entry(&self) -> Option<(&String, &TaskStatus)> {
+        let (_, run) = self.selected_run_in_workflow()?;
+        run.tasks.iter().nth(self.selected_task)
+    }
+
+    /// Clamp all selection indices so they stay in-bounds after data changes.
+    pub fn clamp_selections(&mut self) {
+        let names = self.workflow_names();
+        let wf_count = names.len();
+        if wf_count > 0 {
+            self.selected_workflow = self.selected_workflow.min(wf_count - 1);
+        } else {
+            self.selected_workflow = 0;
+        }
+
+        let selected_wf = names.get(self.selected_workflow).cloned();
+        let run_count = self.runs.values()
+            .filter(|r| selected_wf.as_deref() == Some(r.workflow.as_str()))
+            .count();
+        if run_count > 0 {
+            self.selected = self.selected.min(run_count - 1);
+        } else {
+            self.selected = 0;
+        }
+
+        let task_count = self.selected_run_in_workflow()
+            .map(|(_, r)| r.tasks.len())
+            .unwrap_or(0);
+        if task_count > 0 {
+            self.selected_task = self.selected_task.min(task_count - 1);
+        } else {
+            self.selected_task = 0;
+        }
+    }
+
+    pub fn select_next_workflow(&mut self) {
+        let count = self.workflow_names().len();
+        if count > 0 {
+            self.selected_workflow = (self.selected_workflow + 1).min(count - 1);
+            self.selected = 0;
+            self.selected_task = 0;
+            self.task_scroll = 0;
+        }
+    }
+
+    pub fn select_prev_workflow(&mut self) {
+        self.selected_workflow = self.selected_workflow.saturating_sub(1);
+        self.selected = 0;
+        self.selected_task = 0;
+        self.task_scroll = 0;
+    }
+
+    pub fn select_next_run_in_workflow(&mut self) {
+        let count = self.runs_for_selected_workflow().len();
+        if count > 0 {
+            self.selected = (self.selected + 1).min(count - 1);
+            self.selected_task = 0;
+            self.task_scroll = 0;
+        }
+    }
+
+    pub fn select_prev_run_in_workflow(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+        self.selected_task = 0;
+        self.task_scroll = 0;
+    }
+
+    pub fn select_next_task(&mut self) {
+        let count = self.selected_run_in_workflow()
+            .map(|(_, r)| r.tasks.len())
+            .unwrap_or(0);
+        if count > 0 {
+            self.selected_task = (self.selected_task + 1).min(count - 1);
+            self.task_scroll = 0;
+        }
+    }
+
+    pub fn select_prev_task(&mut self) {
+        self.selected_task = self.selected_task.saturating_sub(1);
+        self.task_scroll = 0;
+    }
+
+    pub fn scroll_task_down(&mut self) {
+        self.task_scroll += 1;
+    }
+
+    pub fn scroll_task_up(&mut self) {
+        self.task_scroll = self.task_scroll.saturating_sub(1);
+    }
+
+    pub fn navigate_down(&mut self) {
+        match self.focus {
+            Focus::Workflows  => self.select_next_workflow(),
+            Focus::Runs       => self.select_next_run_in_workflow(),
+            Focus::Tasks      => self.select_next_task(),
+            Focus::TaskDetail => self.scroll_task_down(),
+        }
+    }
+
+    pub fn navigate_up(&mut self) {
+        match self.focus {
+            Focus::Workflows  => self.select_prev_workflow(),
+            Focus::Runs       => self.select_prev_run_in_workflow(),
+            Focus::Tasks      => self.select_prev_task(),
+            Focus::TaskDetail => self.scroll_task_up(),
+        }
+    }
+
+    pub fn focus_right(&mut self) {
+        self.focus = match self.focus {
+            Focus::Workflows => Focus::Runs,
+            Focus::Runs      => Focus::Tasks,
+            Focus::Tasks | Focus::TaskDetail => Focus::TaskDetail,
+        };
+    }
+
+    pub fn focus_left(&mut self) {
+        self.task_scroll = 0;
+        self.focus = match self.focus {
+            Focus::TaskDetail => Focus::Tasks,
+            Focus::Tasks      => Focus::Runs,
+            Focus::Runs       => Focus::Workflows,
+            Focus::Workflows  => Focus::Workflows,
+        };
+    }
+
+    pub fn enter_pane(&mut self) {
+        match self.focus {
+            Focus::Workflows => { self.focus = Focus::Runs; }
+            Focus::Runs      => { self.focus = Focus::Tasks; }
+            Focus::Tasks     => {
+                if self.selected_task_entry().is_some() {
+                    self.task_scroll = 0;
+                    self.focus = Focus::TaskDetail;
+                }
+            }
+            Focus::TaskDetail => {}
+        }
+    }
+
+    pub fn escape_pane(&mut self) {
+        match self.focus {
+            Focus::TaskDetail => { self.task_scroll = 0; self.focus = Focus::Tasks; }
+            Focus::Tasks      => { self.focus = Focus::Runs; }
+            Focus::Runs       => { self.focus = Focus::Workflows; }
+            Focus::Workflows  => {}
+        }
     }
 }
 
@@ -259,6 +457,13 @@ impl App {
     pub fn set_graph(&mut self, graph: DependencyGraph) { self.active_source_mut().set_graph(graph); }
     pub fn toggle_graph(&mut self) { self.active_source_mut().toggle_graph(); }
     pub fn apply_run_detail(&mut self, detail: RunDetailDto) { self.active_source_mut().apply_run_detail(detail); }
+
+    pub fn navigate_up(&mut self)   { self.active_source_mut().navigate_up(); }
+    pub fn navigate_down(&mut self) { self.active_source_mut().navigate_down(); }
+    pub fn focus_left(&mut self)    { self.active_source_mut().focus_left(); }
+    pub fn focus_right(&mut self)   { self.active_source_mut().focus_right(); }
+    pub fn enter_pane(&mut self)    { self.active_source_mut().enter_pane(); }
+    pub fn escape_pane(&mut self)   { self.active_source_mut().escape_pane(); }
 }
 
 #[cfg(test)]
@@ -623,5 +828,168 @@ mod tests {
 
         app.active = 1;
         assert_eq!(app.active_source().selected, 0, "source 1 selection should be independent");
+    }
+
+    // --- Sprint 13: multi-pane navigation ---
+
+    #[test]
+    fn workflow_names_deduplicates_across_runs() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(started("r2", "deploy"));
+        app.handle(started("r3", "build"));
+        let names = app.active_source().workflow_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"deploy".to_string()));
+        assert!(names.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn workflow_names_excludes_rejected_runs() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(rejected("r2", "gate failed")); // empty workflow
+        let names = app.active_source().workflow_names();
+        assert_eq!(names, vec!["deploy"]);
+    }
+
+    #[test]
+    fn runs_for_selected_workflow_filters_by_selected_workflow() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(started("r2", "build"));
+        app.handle(started("r3", "deploy"));
+
+        let src = app.active_source_mut();
+        src.selected_workflow = 0; // first workflow (newest-first)
+        let runs = src.runs_for_selected_workflow();
+        // All runs in the selected workflow should have the same workflow name
+        let first_wf = &runs[0].1.workflow.clone();
+        assert!(runs.iter().all(|(_, r)| &r.workflow == first_wf));
+    }
+
+    #[test]
+    fn navigate_down_in_workflows_focus_changes_selected_workflow() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(started("r2", "build"));
+        {
+            let src = app.active_source_mut();
+            src.focus = Focus::Workflows;
+            src.selected_workflow = 0;
+        }
+        app.active_source_mut().navigate_down();
+        assert_eq!(app.active_source().selected_workflow, 1);
+    }
+
+    #[test]
+    fn navigate_up_in_workflows_focus_clamps_at_zero() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        {
+            let src = app.active_source_mut();
+            src.focus = Focus::Workflows;
+            src.selected_workflow = 0;
+        }
+        app.active_source_mut().navigate_up();
+        assert_eq!(app.active_source().selected_workflow, 0);
+    }
+
+    #[test]
+    fn enter_pane_advances_focus_from_workflows_to_runs() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.active_source_mut().focus = Focus::Workflows;
+        app.active_source_mut().enter_pane();
+        assert_eq!(app.active_source().focus, Focus::Runs);
+    }
+
+    #[test]
+    fn enter_pane_advances_focus_from_runs_to_tasks() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.active_source_mut().focus = Focus::Runs;
+        app.active_source_mut().enter_pane();
+        assert_eq!(app.active_source().focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn enter_pane_opens_task_detail_when_task_has_output() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(Event::TaskFinished {
+            run_id: "r1".into(), task: "build".into(), success: true,
+            exit_code: 0, stdout: "done\n".into(), stderr: String::new(), timestamp: 0,
+        });
+        app.active_source_mut().focus = Focus::Tasks;
+        app.active_source_mut().enter_pane();
+        assert_eq!(app.active_source().focus, Focus::TaskDetail);
+    }
+
+    #[test]
+    fn escape_pane_retreats_focus_from_task_detail_to_tasks() {
+        let mut app = App::new();
+        app.active_source_mut().focus = Focus::TaskDetail;
+        app.active_source_mut().escape_pane();
+        assert_eq!(app.active_source().focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn escape_pane_retreats_focus_from_runs_to_workflows() {
+        let mut app = App::new();
+        app.active_source_mut().focus = Focus::Runs;
+        app.active_source_mut().escape_pane();
+        assert_eq!(app.active_source().focus, Focus::Workflows);
+    }
+
+    #[test]
+    fn focus_left_and_right_cycle_panes() {
+        let mut app = App::new();
+        let src = app.active_source_mut();
+        src.focus = Focus::Workflows;
+        src.focus_right();
+        assert_eq!(src.focus, Focus::Runs);
+        src.focus_right();
+        assert_eq!(src.focus, Focus::Tasks);
+        src.focus_right();
+        assert_eq!(src.focus, Focus::TaskDetail);
+        src.focus_left();
+        assert_eq!(src.focus, Focus::Tasks);
+        src.focus_left();
+        assert_eq!(src.focus, Focus::Runs);
+        src.focus_left();
+        assert_eq!(src.focus, Focus::Workflows);
+        src.focus_left(); // already at leftmost
+        assert_eq!(src.focus, Focus::Workflows);
+    }
+
+    #[test]
+    fn clamp_selections_prevents_out_of_bounds_after_workflow_removed() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(started("r2", "build"));
+        {
+            let src = app.active_source_mut();
+            src.selected_workflow = 1; // "build"
+        }
+        // Manually remove runs to simulate data shrink, then clamp
+        app.active_source_mut().runs.clear();
+        app.active_source_mut().clamp_selections();
+        assert_eq!(app.active_source().selected_workflow, 0);
+        assert_eq!(app.active_source().selected, 0);
+    }
+
+    #[test]
+    fn task_scroll_resets_on_workflow_change() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(started("r2", "build"));
+        {
+            let src = app.active_source_mut();
+            src.task_scroll = 5;
+            src.focus = Focus::Workflows;
+        }
+        app.active_source_mut().navigate_down();
+        assert_eq!(app.active_source().task_scroll, 0);
     }
 }

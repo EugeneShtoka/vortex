@@ -63,6 +63,12 @@ pub struct TaskConfig {
     /// task results (including this task's own stdout via `{{tasks.<id>.stdout}}`),
     /// trigger params, globals, env vars, and `{{correlation_id}}`.
     pub response_template: Option<String>,
+    /// CEL expression evaluated after this task completes. If it evaluates to `true`,
+    /// the workflow stops immediately and remaining tasks are skipped. `self` is bound
+    /// to the current task's result (`self.success`, `self.stdout`, `self.stderr`,
+    /// `self.exit_code`, `self.output`). The full `tasks.*` context is also available.
+    /// Example: `abort_if = "self.success"` stops the workflow when this task succeeds.
+    pub abort_if: Option<String>,
 }
 
 /// Task type dispatched by the engine. Tagged: `type = "shell"` etc. in TOML.

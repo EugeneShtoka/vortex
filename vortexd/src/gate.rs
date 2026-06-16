@@ -111,6 +111,19 @@ pub fn evaluate_value(
     program.execute(&ctx).map_err(|e| anyhow::anyhow!("Eval error in '{expr}': {e}"))
 }
 
+/// Convert a `TaskResult` to a CEL value with the same shape as `tasks.<id>` entries in context.
+/// Used to bind `self` when evaluating `abort_if` expressions.
+pub fn task_result_to_cel(result: &TaskResult) -> Result<Value> {
+    let json = serde_json::json!({
+        "success":   result.success,
+        "stdout":    result.stdout.trim(),
+        "stderr":    result.stderr.trim(),
+        "exit_code": result.exit_code,
+        "output":    result.output,
+    });
+    to_cel(&json)
+}
+
 fn build_context<'a>(
     results: &'a HashMap<String, TaskResult>,
     all_ids: &'a [&'a str],
