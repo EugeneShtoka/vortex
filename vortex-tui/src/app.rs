@@ -1,10 +1,44 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use indexmap::IndexMap;
 use serde::Deserialize;
 use vortex_core::Event;
 
+use crate::config::{TuiLayout, ViewMode};
 use crate::graph::DependencyGraph;
+
+/// REST response shape from GET /workflows
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowIssueSummary {
+    pub name:        String,
+    pub issue_count: WorkflowIssueCounts,
+    pub issues:      Vec<WorkflowIssue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowIssueCounts {
+    pub errors:   usize,
+    pub warnings: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowIssue {
+    pub severity: String,
+    pub task_id:  Option<String>,
+    pub code:     String,
+    pub message:  String,
+}
+
+/// REST response shape from GET /runs/{id}/tasks/{task_id}/logs
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogEntry {
+    pub run_id:    String,
+    pub task_id:   String,
+    pub stream:    String,
+    pub line:      String,
+    pub logged_at: u64,
+}
 
 /// REST response shapes from GET /runs and GET /runs/{id}
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +46,7 @@ pub struct RunSummary {
     pub id: String,
     pub workflow: String,
     pub status: String,
+    #[serde(default)]
     pub rejection: Option<String>,
     pub started_at: u64,
     pub finished_at: Option<u64>,
@@ -26,6 +61,57 @@ pub struct TaskSummary {
     pub stderr: Option<String>,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
+    // Sprint 17 — task config fields, populated by GET /runs/{id}
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub task_exec: Option<String>,
+    #[serde(default)]
+    pub task_when: Option<String>,
+    #[serde(default)]
+    pub task_abort_if: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GlobalsDiffEntry {
+    Changed { key: String, before: String, after: String },
+    Added   { key: String, value: String },
+    Removed { key: String, value: String },
+}
+
+pub fn diff_globals(
+    pre: &HashMap<String, String>,
+    post: &HashMap<String, String>,
+) -> Vec<GlobalsDiffEntry> {
+    let mut diff = Vec::new();
+    for (key, after) in post {
+        match pre.get(key) {
+            Some(before) if before != after => diff.push(GlobalsDiffEntry::Changed {
+                key: key.clone(), before: before.clone(), after: after.clone(),
+            }),
+            None => diff.push(GlobalsDiffEntry::Added { key: key.clone(), value: after.clone() }),
+            _ => {}
+        }
+    }
+    for key in pre.keys() {
+        if !post.contains_key(key) {
+            diff.push(GlobalsDiffEntry::Removed { key: key.clone(), value: pre[key].clone() });
+        }
+    }
+    diff.sort_by(|a, b| {
+        let ka = match a {
+            GlobalsDiffEntry::Changed { key, .. }
+            | GlobalsDiffEntry::Added   { key, .. }
+            | GlobalsDiffEntry::Removed { key, .. } => key,
+        };
+        let kb = match b {
+            GlobalsDiffEntry::Changed { key, .. }
+            | GlobalsDiffEntry::Added   { key, .. }
+            | GlobalsDiffEntry::Removed { key, .. } => key,
+        };
+        ka.cmp(kb)
+    });
+    diff
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +119,34 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub summary: RunSummary,
     pub tasks: Vec<TaskSummary>,
+}
+
+/// Deserialization shape matching GET /triggers response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerSummaryDto {
+    pub id:              String,
+    pub workflow:        String,
+    pub status:          String,
+    pub source:          String,
+    pub rejection_cause: Option<String>,
+    pub received_at:     u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEntryStatus {
+    Running,
+    Finished(bool),
+    Rejected(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerEntry {
+    pub id:          String,
+    pub workflow:    Option<String>,
+    pub run_id:      Option<String>,
+    pub source:      String,
+    pub status:      TriggerEntryStatus,
+    pub received_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,10 +182,11 @@ pub enum ConnectionStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Focus {
-    Workflows,
+    TriggerList,
+    WorkflowList,
     Runs,
     Tasks,
-    TaskDetail,
+    Detail,
 }
 
 /// Per-daemon state: runs, selection, graph modal, connection status.
@@ -79,52 +194,124 @@ pub struct SourceState {
     pub name: String,
     pub connection: ConnectionStatus,
     pub runs: IndexMap<String, RunState>,
+    pub triggers: IndexMap<String, TriggerEntry>,
     pub selected: usize,
     pub selected_workflow: usize,
+    pub selected_trigger: usize,
     pub selected_task: usize,
     pub task_scroll: usize,
     pub focus: Focus,
+    pub view_mode: ViewMode,
+    pub layout: TuiLayout,
     pub graph: Option<DependencyGraph>,
     pub show_graph: bool,
+    pub globals_pre:  HashMap<String, HashMap<String, String>>,
+    pub globals_post: HashMap<String, HashMap<String, String>>,
+    /// task config fields cached from GET /runs/{id} — run_id → task_id → TaskSummary
+    pub task_summaries: HashMap<String, HashMap<String, TaskSummary>>,
+    /// validation issues per workflow, populated from GET /workflows on connect
+    pub workflow_issues: IndexMap<String, WorkflowIssueSummary>,
+    /// task log lines fetched lazily — (run_id, task_id) → lines
+    pub task_logs: HashMap<(String, String), Vec<LogEntry>>,
 }
 
 impl SourceState {
     pub fn new(name: impl Into<String>) -> Self {
+        let layout = TuiLayout::default();
+        let view_mode = layout.default_mode.clone();
         Self {
             name: name.into(),
             connection: ConnectionStatus::Connecting,
             runs: IndexMap::new(),
+            triggers: IndexMap::new(),
             selected: 0,
             selected_workflow: 0,
+            selected_trigger: 0,
             selected_task: 0,
             task_scroll: 0,
-            focus: Focus::Workflows,
+            focus: Focus::WorkflowList,
+            view_mode,
+            layout,
             graph: None,
             show_graph: false,
+            globals_pre:  HashMap::new(),
+            globals_post: HashMap::new(),
+            task_summaries: HashMap::new(),
+            workflow_issues: IndexMap::new(),
+            task_logs: HashMap::new(),
+        }
+    }
+
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.focus = match &mode {
+            ViewMode::Triggers  => Focus::TriggerList,
+            ViewMode::Workflows => Focus::WorkflowList,
+        };
+        self.view_mode = mode;
+    }
+
+    fn list_focus(&self) -> Focus {
+        match self.view_mode {
+            ViewMode::Triggers  => Focus::TriggerList,
+            ViewMode::Workflows => Focus::WorkflowList,
+        }
+    }
+
+    fn clamp_focus_to_panels(&mut self) {
+        let panels = self.layout.panels;
+        let new_focus = match self.focus {
+            Focus::Tasks if panels < 3 => {
+                Some(if panels >= 2 { Focus::Runs } else { self.list_focus() })
+            }
+            Focus::Runs if panels < 2 => Some(self.list_focus()),
+            _ => None,
+        };
+        if let Some(f) = new_focus {
+            self.focus = f;
         }
     }
 
     pub fn handle(&mut self, event: Event) {
         match event {
             Event::WorkflowStarted { run_id, workflow, timestamp } => {
-                self.runs.insert(run_id, RunState {
-                    workflow,
+                self.runs.insert(run_id.clone(), RunState {
+                    workflow: workflow.clone(),
                     status: RunStatus::Running,
                     tasks: IndexMap::new(),
                     started_at: Instant::now(),
                     started_at_ms: timestamp,
                     finished_at_ms: None,
                 });
+                let entry = self.triggers.entry(run_id.clone()).or_insert_with(|| TriggerEntry {
+                    id: run_id.clone(),
+                    workflow: Some(workflow.clone()),
+                    run_id: Some(run_id.clone()),
+                    source: String::new(),
+                    status: TriggerEntryStatus::Running,
+                    received_at: timestamp,
+                });
+                entry.workflow = Some(workflow);
+                entry.run_id = Some(run_id);
+                entry.status = TriggerEntryStatus::Running;
             }
             Event::TriggerRejected { run_id, reason } => {
-                self.runs.insert(run_id, RunState {
+                self.runs.insert(run_id.clone(), RunState {
                     workflow: String::new(),
-                    status: RunStatus::Rejected(reason),
+                    status: RunStatus::Rejected(reason.clone()),
                     tasks: IndexMap::new(),
                     started_at: Instant::now(),
                     started_at_ms: 0,
                     finished_at_ms: None,
                 });
+                let new_status = TriggerEntryStatus::Rejected(reason.clone());
+                self.triggers.entry(run_id.clone()).or_insert_with(|| TriggerEntry {
+                    id: run_id,
+                    workflow: None,
+                    run_id: None,
+                    source: String::new(),
+                    status: TriggerEntryStatus::Rejected(reason),
+                    received_at: 0,
+                }).status = new_status;
             }
             Event::TaskStarted { run_id, task, .. } => {
                 if let Some(run) = self.runs.get_mut(&run_id) {
@@ -146,6 +333,9 @@ impl SourceState {
                     run.status = RunStatus::Finished(success);
                     run.finished_at_ms = Some(timestamp);
                 }
+                if let Some(entry) = self.triggers.get_mut(&run_id) {
+                    entry.status = TriggerEntryStatus::Finished(success);
+                }
             }
             _ => {}
         }
@@ -156,7 +346,7 @@ impl SourceState {
     pub fn apply_run_detail(&mut self, detail: RunDetailDto) {
         let status = match detail.summary.status.as_str() {
             "success"  => RunStatus::Finished(true),
-            "failure"  => RunStatus::Finished(false),
+            "failed"   => RunStatus::Finished(false),
             "rejected" => RunStatus::Rejected(detail.summary.rejection.clone().unwrap_or_default()),
             _          => RunStatus::Running,
         };
@@ -168,7 +358,7 @@ impl SourceState {
                     stdout: t.stdout.clone().unwrap_or_default(),
                     stderr: t.stderr.clone().unwrap_or_default(),
                 },
-                "failure" => TaskStatus::Finished {
+                "failed"  => TaskStatus::Finished {
                     success: false,
                     exit_code: t.exit_code.unwrap_or(1),
                     stdout: t.stdout.clone().unwrap_or_default(),
@@ -180,6 +370,12 @@ impl SourceState {
             (t.task_id.clone(), ts)
         }).collect();
 
+        // Cache task summaries (for config fields in the detail panel)
+        let summaries: HashMap<String, TaskSummary> = detail.tasks.iter()
+            .map(|t| (t.task_id.clone(), t.clone()))
+            .collect();
+        self.task_summaries.insert(detail.summary.id.clone(), summaries);
+
         self.runs.insert(detail.summary.id.clone(), RunState {
             workflow: detail.summary.workflow,
             status,
@@ -189,6 +385,91 @@ impl SourceState {
             finished_at_ms: detail.summary.finished_at,
         });
         self.clamp_selections();
+    }
+
+    pub fn run_task_summary(&self, run_id: &str, task_id: &str) -> Option<&TaskSummary> {
+        self.task_summaries.get(run_id)?.get(task_id)
+    }
+
+    /// Populate trigger entries from a REST API response (GET /triggers).
+    pub fn apply_triggers(&mut self, dtos: Vec<TriggerSummaryDto>) {
+        for t in dtos {
+            let status = match t.status.as_str() {
+                "rejected" => TriggerEntryStatus::Rejected(
+                    t.rejection_cause.clone().unwrap_or_default()
+                ),
+                "finished" => {
+                    let success = self.runs.get(&t.id)
+                        .map(|r| matches!(r.status, RunStatus::Finished(true)))
+                        .unwrap_or(false);
+                    TriggerEntryStatus::Finished(success)
+                }
+                _ => TriggerEntryStatus::Running,
+            };
+            let run_id = if t.status != "rejected" { Some(t.id.clone()) } else { None };
+            let workflow = if t.workflow.is_empty() { None } else { Some(t.workflow) };
+            self.triggers.entry(t.id.clone()).or_insert(TriggerEntry {
+                id: t.id,
+                workflow,
+                run_id,
+                source: t.source,
+                status,
+                received_at: t.received_at,
+            });
+        }
+        self.clamp_selections();
+    }
+
+    pub fn apply_workflow_summaries(&mut self, summaries: Vec<WorkflowIssueSummary>) {
+        for s in summaries {
+            self.workflow_issues.insert(s.name.clone(), s);
+        }
+    }
+
+    pub fn apply_task_logs(&mut self, run_id: &str, task_id: &str, logs: Vec<LogEntry>) {
+        self.task_logs.insert((run_id.to_string(), task_id.to_string()), logs);
+    }
+
+    /// Triggers sorted newest-first.
+    pub fn apply_globals_pre(&mut self, run_id: &str, globals: HashMap<String, String>) {
+        self.globals_pre.insert(run_id.to_string(), globals);
+    }
+
+    pub fn apply_globals_post(&mut self, run_id: &str, globals: HashMap<String, String>) {
+        self.globals_post.insert(run_id.to_string(), globals);
+    }
+
+    pub fn sorted_triggers(&self) -> Vec<&TriggerEntry> {
+        let mut triggers: Vec<&TriggerEntry> = self.triggers.values().collect();
+        triggers.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        triggers
+    }
+
+    pub fn selected_trigger_entry(&self) -> Option<&TriggerEntry> {
+        self.sorted_triggers().into_iter().nth(self.selected_trigger)
+    }
+
+    /// Runs linked to the currently selected trigger (0 or 1).
+    pub fn runs_for_selected_trigger(&self) -> Vec<(&String, &RunState)> {
+        let entry = self.sorted_triggers().into_iter().nth(self.selected_trigger);
+        let Some(entry) = entry else { return vec![] };
+        let Some(run_id) = &entry.run_id else { return vec![] };
+        self.runs.get_key_value(run_id)
+            .map(|(k, v)| vec![(k, v)])
+            .unwrap_or_default()
+    }
+
+    /// Runs visible in the Runs column based on current view mode.
+    pub fn active_runs(&self) -> Vec<(&String, &RunState)> {
+        match self.view_mode {
+            ViewMode::Triggers  => self.runs_for_selected_trigger(),
+            ViewMode::Workflows => self.runs_for_selected_workflow(),
+        }
+    }
+
+    /// Selected run within the active view (mode-aware).
+    pub fn selected_active_run(&self) -> Option<(&String, &RunState)> {
+        self.active_runs().into_iter().nth(self.selected)
     }
 
     pub fn set_graph(&mut self, graph: DependencyGraph) {
@@ -254,12 +535,21 @@ impl SourceState {
 
     /// The task currently highlighted in the tasks pane.
     pub fn selected_task_entry(&self) -> Option<(&String, &TaskStatus)> {
-        let (_, run) = self.selected_run_in_workflow()?;
+        let (_, run) = self.selected_active_run()?;
         run.tasks.iter().nth(self.selected_task)
     }
 
     /// Clamp all selection indices so they stay in-bounds after data changes.
     pub fn clamp_selections(&mut self) {
+        // Trigger selection
+        let trigger_count = self.triggers.len();
+        if trigger_count > 0 {
+            self.selected_trigger = self.selected_trigger.min(trigger_count - 1);
+        } else {
+            self.selected_trigger = 0;
+        }
+
+        // Workflow selection
         let names = self.workflow_names();
         let wf_count = names.len();
         if wf_count > 0 {
@@ -268,17 +558,16 @@ impl SourceState {
             self.selected_workflow = 0;
         }
 
-        let selected_wf = names.get(self.selected_workflow).cloned();
-        let run_count = self.runs.values()
-            .filter(|r| selected_wf.as_deref() == Some(r.workflow.as_str()))
-            .count();
+        // Run selection (mode-aware; active_runs is safe now that trigger/workflow are clamped)
+        let run_count = self.active_runs().len();
         if run_count > 0 {
             self.selected = self.selected.min(run_count - 1);
         } else {
             self.selected = 0;
         }
 
-        let task_count = self.selected_run_in_workflow()
+        // Task selection
+        let task_count = self.selected_active_run()
             .map(|(_, r)| r.tasks.len())
             .unwrap_or(0);
         if task_count > 0 {
@@ -321,7 +610,7 @@ impl SourceState {
     }
 
     pub fn select_next_task(&mut self) {
-        let count = self.selected_run_in_workflow()
+        let count = self.selected_active_run()
             .map(|(_, r)| r.tasks.len())
             .unwrap_or(0);
         if count > 0 {
@@ -335,6 +624,38 @@ impl SourceState {
         self.task_scroll = 0;
     }
 
+    pub fn select_next_trigger(&mut self) {
+        let count = self.triggers.len();
+        if count > 0 {
+            self.selected_trigger = (self.selected_trigger + 1).min(count - 1);
+            self.selected = 0;
+            self.selected_task = 0;
+            self.task_scroll = 0;
+        }
+    }
+
+    pub fn select_prev_trigger(&mut self) {
+        self.selected_trigger = self.selected_trigger.saturating_sub(1);
+        self.selected = 0;
+        self.selected_task = 0;
+        self.task_scroll = 0;
+    }
+
+    pub fn select_next_active_run(&mut self) {
+        let count = self.active_runs().len();
+        if count > 0 {
+            self.selected = (self.selected + 1).min(count - 1);
+            self.selected_task = 0;
+            self.task_scroll = 0;
+        }
+    }
+
+    pub fn select_prev_active_run(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+        self.selected_task = 0;
+        self.task_scroll = 0;
+    }
+
     pub fn scroll_task_down(&mut self) {
         self.task_scroll += 1;
     }
@@ -345,60 +666,66 @@ impl SourceState {
 
     pub fn navigate_down(&mut self) {
         match self.focus {
-            Focus::Workflows  => self.select_next_workflow(),
-            Focus::Runs       => self.select_next_run_in_workflow(),
-            Focus::Tasks      => self.select_next_task(),
-            Focus::TaskDetail => self.scroll_task_down(),
+            Focus::TriggerList  => self.select_next_trigger(),
+            Focus::WorkflowList => self.select_next_workflow(),
+            Focus::Runs         => self.select_next_active_run(),
+            Focus::Tasks        => self.select_next_task(),
+            Focus::Detail       => self.scroll_task_down(),
         }
     }
 
     pub fn navigate_up(&mut self) {
         match self.focus {
-            Focus::Workflows  => self.select_prev_workflow(),
-            Focus::Runs       => self.select_prev_run_in_workflow(),
-            Focus::Tasks      => self.select_prev_task(),
-            Focus::TaskDetail => self.scroll_task_up(),
+            Focus::TriggerList  => self.select_prev_trigger(),
+            Focus::WorkflowList => self.select_prev_workflow(),
+            Focus::Runs         => self.select_prev_active_run(),
+            Focus::Tasks        => self.select_prev_task(),
+            Focus::Detail       => self.scroll_task_up(),
         }
     }
 
     pub fn focus_right(&mut self) {
         self.focus = match self.focus {
-            Focus::Workflows => Focus::Runs,
-            Focus::Runs      => Focus::Tasks,
-            Focus::Tasks | Focus::TaskDetail => Focus::TaskDetail,
+            Focus::TriggerList | Focus::WorkflowList => Focus::Runs,
+            Focus::Runs                              => Focus::Tasks,
+            Focus::Tasks | Focus::Detail             => Focus::Detail,
         };
     }
 
     pub fn focus_left(&mut self) {
         self.task_scroll = 0;
-        self.focus = match self.focus {
-            Focus::TaskDetail => Focus::Tasks,
-            Focus::Tasks      => Focus::Runs,
-            Focus::Runs       => Focus::Workflows,
-            Focus::Workflows  => Focus::Workflows,
+        self.focus = match (&self.focus, &self.view_mode) {
+            (Focus::Detail, _)                 => Focus::Tasks,
+            (Focus::Tasks, _)                  => Focus::Runs,
+            (Focus::Runs, ViewMode::Triggers)  => Focus::TriggerList,
+            (Focus::Runs, ViewMode::Workflows) => Focus::WorkflowList,
+            (Focus::TriggerList, _)            => Focus::TriggerList,
+            (Focus::WorkflowList, _)           => Focus::WorkflowList,
         };
     }
 
     pub fn enter_pane(&mut self) {
         match self.focus {
-            Focus::Workflows => { self.focus = Focus::Runs; }
-            Focus::Runs      => { self.focus = Focus::Tasks; }
-            Focus::Tasks     => {
+            Focus::TriggerList | Focus::WorkflowList => { self.focus = Focus::Runs; }
+            Focus::Runs => { self.focus = Focus::Tasks; }
+            Focus::Tasks => {
                 if self.selected_task_entry().is_some() {
                     self.task_scroll = 0;
-                    self.focus = Focus::TaskDetail;
+                    self.focus = Focus::Detail;
                 }
             }
-            Focus::TaskDetail => {}
+            Focus::Detail => {}
         }
     }
 
     pub fn escape_pane(&mut self) {
-        match self.focus {
-            Focus::TaskDetail => { self.task_scroll = 0; self.focus = Focus::Tasks; }
-            Focus::Tasks      => { self.focus = Focus::Runs; }
-            Focus::Runs       => { self.focus = Focus::Workflows; }
-            Focus::Workflows  => {}
+        match (&self.focus, &self.view_mode) {
+            (Focus::Detail, _)                 => { self.task_scroll = 0; self.focus = Focus::Tasks; }
+            (Focus::Tasks, _)                  => { self.focus = Focus::Runs; }
+            (Focus::Runs, ViewMode::Triggers)  => { self.focus = Focus::TriggerList; }
+            (Focus::Runs, ViewMode::Workflows) => { self.focus = Focus::WorkflowList; }
+            (Focus::TriggerList, _)            => {}
+            (Focus::WorkflowList, _)           => {}
         }
     }
 }
@@ -464,6 +791,40 @@ impl App {
     pub fn focus_right(&mut self)   { self.active_source_mut().focus_right(); }
     pub fn enter_pane(&mut self)    { self.active_source_mut().enter_pane(); }
     pub fn escape_pane(&mut self)   { self.active_source_mut().escape_pane(); }
+    pub fn set_view_mode(&mut self, mode: ViewMode) { self.active_source_mut().set_view_mode(mode); }
+
+    /// Switch to Workflow view. When called from Trigger view, also selects the
+    /// workflow linked to the currently selected trigger entry.
+    pub fn jump_to_workflow_view(&mut self) {
+        let src = self.active_source_mut();
+        let linked = matches!(src.view_mode, ViewMode::Triggers)
+            .then(|| src.selected_trigger_entry().and_then(|t| t.workflow.clone()))
+            .flatten();
+        src.set_view_mode(ViewMode::Workflows);
+        if let Some(wf_name) = linked {
+            let names = src.workflow_names();
+            if let Some(idx) = names.iter().position(|n| n == &wf_name) {
+                src.selected_workflow = idx;
+                src.selected = 0;
+            }
+        }
+    }
+
+    pub fn panels_wider(&mut self) {
+        let src = self.active_source_mut();
+        src.layout.panels = (src.layout.panels + 1).min(3);
+    }
+
+    pub fn panels_narrower(&mut self) {
+        let src = self.active_source_mut();
+        if src.layout.panels > 1 {
+            src.layout.panels -= 1;
+            src.clamp_focus_to_panels();
+        }
+    }
+    pub fn apply_triggers(&mut self, dtos: Vec<TriggerSummaryDto>) { self.active_source_mut().apply_triggers(dtos); }
+    pub fn apply_workflow_summaries(&mut self, summaries: Vec<WorkflowIssueSummary>) { self.active_source_mut().apply_workflow_summaries(summaries); }
+    pub fn apply_task_logs(&mut self, run_id: &str, task_id: &str, logs: Vec<LogEntry>) { self.active_source_mut().apply_task_logs(run_id, task_id, logs); }
 }
 
 #[cfg(test)]
@@ -663,8 +1024,8 @@ mod tests {
                 rejection: None, started_at: 0, finished_at: Some(1),
             },
             tasks: vec![
-                TaskSummary { task_id: "pull".into(), status: "success".into(), exit_code: Some(0), stdout: Some("ok\n".into()), stderr: Some(String::new()), started_at: Some(0), finished_at: Some(1) },
-                TaskSummary { task_id: "notify".into(), status: "skipped".into(), exit_code: None, stdout: None, stderr: None, started_at: None, finished_at: None },
+                TaskSummary { task_id: "pull".into(), status: "success".into(), exit_code: Some(0), stdout: Some("ok\n".into()), stderr: Some(String::new()), started_at: Some(0), finished_at: Some(1), task_type: None, task_exec: None, task_when: None, task_abort_if: None },
+                TaskSummary { task_id: "notify".into(), status: "skipped".into(), exit_code: None, stdout: None, stderr: None, started_at: None, finished_at: None, task_type: None, task_exec: None, task_when: None, task_abort_if: None },
             ],
         };
         let mut app = App::new();
@@ -875,7 +1236,7 @@ mod tests {
         app.handle(started("r2", "build"));
         {
             let src = app.active_source_mut();
-            src.focus = Focus::Workflows;
+            src.focus = Focus::WorkflowList;
             src.selected_workflow = 0;
         }
         app.active_source_mut().navigate_down();
@@ -888,7 +1249,7 @@ mod tests {
         app.handle(started("r1", "deploy"));
         {
             let src = app.active_source_mut();
-            src.focus = Focus::Workflows;
+            src.focus = Focus::WorkflowList;
             src.selected_workflow = 0;
         }
         app.active_source_mut().navigate_up();
@@ -899,7 +1260,7 @@ mod tests {
     fn enter_pane_advances_focus_from_workflows_to_runs() {
         let mut app = App::new();
         app.handle(started("r1", "deploy"));
-        app.active_source_mut().focus = Focus::Workflows;
+        app.active_source_mut().focus = Focus::WorkflowList;
         app.active_source_mut().enter_pane();
         assert_eq!(app.active_source().focus, Focus::Runs);
     }
@@ -923,13 +1284,13 @@ mod tests {
         });
         app.active_source_mut().focus = Focus::Tasks;
         app.active_source_mut().enter_pane();
-        assert_eq!(app.active_source().focus, Focus::TaskDetail);
+        assert_eq!(app.active_source().focus, Focus::Detail);
     }
 
     #[test]
-    fn escape_pane_retreats_focus_from_task_detail_to_tasks() {
+    fn escape_pane_retreats_focus_from_detail_to_tasks() {
         let mut app = App::new();
-        app.active_source_mut().focus = Focus::TaskDetail;
+        app.active_source_mut().focus = Focus::Detail;
         app.active_source_mut().escape_pane();
         assert_eq!(app.active_source().focus, Focus::Tasks);
     }
@@ -939,28 +1300,28 @@ mod tests {
         let mut app = App::new();
         app.active_source_mut().focus = Focus::Runs;
         app.active_source_mut().escape_pane();
-        assert_eq!(app.active_source().focus, Focus::Workflows);
+        assert_eq!(app.active_source().focus, Focus::WorkflowList);
     }
 
     #[test]
     fn focus_left_and_right_cycle_panes() {
         let mut app = App::new();
         let src = app.active_source_mut();
-        src.focus = Focus::Workflows;
+        src.focus = Focus::WorkflowList;
         src.focus_right();
         assert_eq!(src.focus, Focus::Runs);
         src.focus_right();
         assert_eq!(src.focus, Focus::Tasks);
         src.focus_right();
-        assert_eq!(src.focus, Focus::TaskDetail);
+        assert_eq!(src.focus, Focus::Detail);
         src.focus_left();
         assert_eq!(src.focus, Focus::Tasks);
         src.focus_left();
         assert_eq!(src.focus, Focus::Runs);
         src.focus_left();
-        assert_eq!(src.focus, Focus::Workflows);
+        assert_eq!(src.focus, Focus::WorkflowList);
         src.focus_left(); // already at leftmost
-        assert_eq!(src.focus, Focus::Workflows);
+        assert_eq!(src.focus, Focus::WorkflowList);
     }
 
     #[test]
@@ -987,9 +1348,368 @@ mod tests {
         {
             let src = app.active_source_mut();
             src.task_scroll = 5;
-            src.focus = Focus::Workflows;
+            src.focus = Focus::WorkflowList;
         }
         app.active_source_mut().navigate_down();
         assert_eq!(app.active_source().task_scroll, 0);
+    }
+
+    // --- Sprint 16: trigger view mode ---
+
+    #[test]
+    fn trigger_entry_inserted_on_trigger_rejected() {
+        let mut app = App::new();
+        app.handle(rejected("r1", "unauthorized"));
+        let src = app.active_source();
+        let triggers = src.sorted_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].id, "r1");
+        assert_eq!(triggers[0].status, TriggerEntryStatus::Rejected("unauthorized".into()));
+        assert!(triggers[0].run_id.is_none());
+    }
+
+    #[test]
+    fn trigger_entry_upserted_on_workflow_started() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        let src = app.active_source();
+        let triggers = src.sorted_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].id, "r1");
+        assert_eq!(triggers[0].workflow, Some("deploy".into()));
+        assert_eq!(triggers[0].run_id, Some("r1".into()));
+        assert_eq!(triggers[0].status, TriggerEntryStatus::Running);
+    }
+
+    #[test]
+    fn trigger_entry_status_updated_on_workflow_finished() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        app.handle(workflow_finished("r1", "deploy", true));
+        let triggers = app.active_source().sorted_triggers();
+        assert_eq!(triggers[0].status, TriggerEntryStatus::Finished(true));
+    }
+
+    #[test]
+    fn runs_for_selected_trigger_returns_linked_run() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        let src = app.active_source_mut();
+        src.selected_trigger = 0;
+        let runs = src.runs_for_selected_trigger();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, "r1");
+    }
+
+    #[test]
+    fn sorted_triggers_newest_first() {
+        let mut app = App::new();
+        app.active_source_mut().triggers.insert("t1".into(), TriggerEntry {
+            id: "t1".into(), workflow: None, run_id: None, source: String::new(),
+            status: TriggerEntryStatus::Running, received_at: 100,
+        });
+        app.active_source_mut().triggers.insert("t2".into(), TriggerEntry {
+            id: "t2".into(), workflow: None, run_id: None, source: String::new(),
+            status: TriggerEntryStatus::Running, received_at: 200,
+        });
+        let sorted = app.active_source().sorted_triggers();
+        assert_eq!(sorted[0].id, "t2");
+        assert_eq!(sorted[1].id, "t1");
+    }
+
+    #[test]
+    fn view_mode_starts_at_workflows_by_default() {
+        let app = App::new();
+        assert_eq!(app.active_source().view_mode, ViewMode::Workflows);
+        assert_eq!(app.active_source().focus, Focus::WorkflowList);
+    }
+
+    #[test]
+    fn focus_advances_through_trigger_hierarchy() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        let src = app.active_source_mut();
+        src.set_view_mode(ViewMode::Triggers);
+        assert_eq!(src.focus, Focus::TriggerList);
+        src.enter_pane();
+        assert_eq!(src.focus, Focus::Runs);
+        src.enter_pane();
+        assert_eq!(src.focus, Focus::Tasks);
+        src.escape_pane();
+        assert_eq!(src.focus, Focus::Runs);
+        src.escape_pane();
+        assert_eq!(src.focus, Focus::TriggerList);
+    }
+
+    #[test]
+    fn focus_advances_through_workflow_hierarchy() {
+        let mut app = App::new();
+        app.handle(started("r1", "deploy"));
+        let src = app.active_source_mut();
+        src.set_view_mode(ViewMode::Workflows);
+        assert_eq!(src.focus, Focus::WorkflowList);
+        src.enter_pane();
+        assert_eq!(src.focus, Focus::Runs);
+        src.enter_pane();
+        assert_eq!(src.focus, Focus::Tasks);
+        src.escape_pane();
+        assert_eq!(src.focus, Focus::Runs);
+        src.escape_pane();
+        assert_eq!(src.focus, Focus::WorkflowList);
+    }
+
+    #[test]
+    fn apply_triggers_populates_from_rest_response() {
+        let mut app = App::new();
+        let dtos = vec![
+            TriggerSummaryDto {
+                id: "t1".into(), workflow: "deploy".into(), status: "running".into(),
+                source: "http".into(), rejection_cause: None, received_at: 1000,
+            },
+            TriggerSummaryDto {
+                id: "t2".into(), workflow: String::new(), status: "rejected".into(),
+                source: "http".into(), rejection_cause: Some("unauthorized".into()), received_at: 2000,
+            },
+        ];
+        app.active_source_mut().apply_triggers(dtos);
+        let src = app.active_source();
+        assert_eq!(src.triggers.len(), 2);
+        assert_eq!(src.triggers.get("t1").unwrap().run_id, Some("t1".into()));
+        let t2 = src.triggers.get("t2").unwrap();
+        assert!(t2.run_id.is_none());
+        assert!(matches!(t2.status, TriggerEntryStatus::Rejected(_)));
+    }
+
+    // --- Sprint 17: detail panel + globals diff ---
+
+    #[test]
+    fn diff_globals_detects_changed_key() {
+        let mut pre = HashMap::new();
+        pre.insert("counter".to_string(), "1".to_string());
+        let mut post = HashMap::new();
+        post.insert("counter".to_string(), "2".to_string());
+        let diff = diff_globals(&pre, &post);
+        assert_eq!(diff.len(), 1);
+        assert!(matches!(&diff[0], GlobalsDiffEntry::Changed { key, before, after }
+            if key == "counter" && before == "1" && after == "2"));
+    }
+
+    #[test]
+    fn diff_globals_detects_added_key() {
+        let pre = HashMap::new();
+        let mut post = HashMap::new();
+        post.insert("new_key".to_string(), "val".to_string());
+        let diff = diff_globals(&pre, &post);
+        assert_eq!(diff.len(), 1);
+        assert!(matches!(&diff[0], GlobalsDiffEntry::Added { key, value }
+            if key == "new_key" && value == "val"));
+    }
+
+    #[test]
+    fn diff_globals_detects_removed_key() {
+        let mut pre = HashMap::new();
+        pre.insert("gone".to_string(), "was_here".to_string());
+        let post = HashMap::new();
+        let diff = diff_globals(&pre, &post);
+        assert_eq!(diff.len(), 1);
+        assert!(matches!(&diff[0], GlobalsDiffEntry::Removed { key, value }
+            if key == "gone" && value == "was_here"));
+    }
+
+    #[test]
+    fn diff_globals_empty_when_no_change() {
+        let mut pre = HashMap::new();
+        pre.insert("same".to_string(), "value".to_string());
+        let post = pre.clone();
+        assert!(diff_globals(&pre, &post).is_empty());
+    }
+
+    #[test]
+    fn diff_globals_sorted_by_key() {
+        let mut pre = HashMap::new();
+        pre.insert("z".to_string(), "1".to_string());
+        pre.insert("a".to_string(), "1".to_string());
+        let mut post = HashMap::new();
+        post.insert("z".to_string(), "2".to_string());
+        post.insert("a".to_string(), "2".to_string());
+        let diff = diff_globals(&pre, &post);
+        assert_eq!(diff.len(), 2);
+        let key0 = match &diff[0] { GlobalsDiffEntry::Changed { key, .. } => key, _ => panic!() };
+        let key1 = match &diff[1] { GlobalsDiffEntry::Changed { key, .. } => key, _ => panic!() };
+        assert!(key0 < key1);
+    }
+
+    #[test]
+    fn apply_globals_pre_stores_snapshot() {
+        let mut src = SourceState::new("test");
+        let mut g = HashMap::new();
+        g.insert("k".to_string(), "v".to_string());
+        src.apply_globals_pre("r1", g.clone());
+        assert_eq!(src.globals_pre.get("r1"), Some(&g));
+        assert!(src.globals_post.is_empty());
+    }
+
+    #[test]
+    fn apply_globals_post_stores_snapshot() {
+        let mut src = SourceState::new("test");
+        let mut g = HashMap::new();
+        g.insert("k".to_string(), "v2".to_string());
+        src.apply_globals_post("r1", g.clone());
+        assert_eq!(src.globals_post.get("r1"), Some(&g));
+        assert!(src.globals_pre.is_empty());
+    }
+
+    #[test]
+    fn detail_focus_reachable_from_tasks() {
+        let mut src = SourceState::new("test");
+        src.handle(Event::WorkflowStarted { run_id: "r1".into(), workflow: "wf".into(), timestamp: 0 });
+        src.handle(Event::TaskFinished {
+            run_id: "r1".into(), task: "t1".into(), success: true,
+            exit_code: 0, stdout: String::new(), stderr: String::new(), timestamp: 0,
+        });
+        src.focus = Focus::Tasks;
+        src.focus_right();
+        assert_eq!(src.focus, Focus::Detail);
+    }
+
+    #[test]
+    fn detail_focus_left_returns_to_tasks() {
+        let mut src = SourceState::new("test");
+        src.focus = Focus::Detail;
+        src.focus_left();
+        assert_eq!(src.focus, Focus::Tasks);
+    }
+
+    #[test]
+    fn escape_from_detail_resets_scroll_and_returns_to_tasks() {
+        let mut src = SourceState::new("test");
+        src.focus = Focus::Detail;
+        src.task_scroll = 7;
+        src.escape_pane();
+        assert_eq!(src.focus, Focus::Tasks);
+        assert_eq!(src.task_scroll, 0);
+    }
+
+    // --- panel toggle ---
+
+    #[test]
+    fn panels_wider_increments_up_to_3() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 1;
+        app.panels_wider();
+        assert_eq!(app.active_source().layout.panels, 2);
+        app.panels_wider();
+        assert_eq!(app.active_source().layout.panels, 3);
+        app.panels_wider(); // no-op at max
+        assert_eq!(app.active_source().layout.panels, 3);
+    }
+
+    #[test]
+    fn panels_narrower_decrements_down_to_1() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 3;
+        app.panels_narrower();
+        assert_eq!(app.active_source().layout.panels, 2);
+        app.panels_narrower();
+        assert_eq!(app.active_source().layout.panels, 1);
+        app.panels_narrower(); // no-op at min
+        assert_eq!(app.active_source().layout.panels, 1);
+    }
+
+    #[test]
+    fn panels_narrower_clamps_tasks_focus_to_runs() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 3;
+        app.active_source_mut().focus = Focus::Tasks;
+        app.panels_narrower(); // 3 → 2
+        assert_eq!(app.active_source().layout.panels, 2);
+        assert_eq!(app.active_source().focus, Focus::Runs);
+    }
+
+    #[test]
+    fn panels_narrower_clamps_runs_focus_to_list() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 2;
+        app.active_source_mut().focus = Focus::Runs;
+        app.panels_narrower(); // 2 → 1
+        assert_eq!(app.active_source().layout.panels, 1);
+        assert_eq!(app.active_source().focus, Focus::WorkflowList);
+    }
+
+    #[test]
+    fn panels_narrower_keeps_detail_focus() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 3;
+        app.active_source_mut().focus = Focus::Detail;
+        app.panels_narrower(); // 3 → 2; Detail always visible
+        assert_eq!(app.active_source().focus, Focus::Detail);
+    }
+
+    #[test]
+    fn panels_narrower_trigger_list_focus_clamps_to_trigger_list() {
+        let mut app = App::new();
+        app.active_source_mut().layout.panels = 2;
+        app.active_source_mut().set_view_mode(crate::config::ViewMode::Triggers);
+        app.active_source_mut().focus = Focus::Runs;
+        app.panels_narrower(); // 2 → 1
+        assert_eq!(app.active_source().focus, Focus::TriggerList);
+    }
+
+    // --- T→W cross-navigation ---
+
+    fn trigger_dto(id: &str, workflow: &str, received_at: u64) -> TriggerSummaryDto {
+        TriggerSummaryDto { id: id.into(), workflow: workflow.into(), status: "accepted".into(), source: "http".into(), rejection_cause: None, received_at }
+    }
+
+    #[test]
+    fn jump_to_workflow_view_selects_linked_workflow() {
+        let mut app = App::new();
+        let src = app.active_source_mut();
+        // Two runs: "build" (ts=1, older), "deploy" (ts=2, newer) → workflow_names() = ["deploy","build"]
+        src.handle(started("r1", "build"));
+        src.handle(started("r2", "deploy"));
+        // Trigger "t1" for "build" — received_at=999 ensures it sorts first among all trigger entries
+        src.apply_triggers(vec![trigger_dto("t1", "build", 999)]);
+        src.set_view_mode(ViewMode::Triggers);
+        // sorted_triggers[0] = "t1" (received_at 999 > r2's 0 > r1's 0)
+
+        app.jump_to_workflow_view();
+
+        let src = app.active_source();
+        assert_eq!(src.view_mode, ViewMode::Workflows);
+        assert_eq!(src.focus, Focus::WorkflowList);
+        let names = src.workflow_names();
+        let selected = names.get(src.selected_workflow).map(String::as_str);
+        assert_eq!(selected, Some("build"));
+    }
+
+    #[test]
+    fn jump_to_workflow_view_noop_when_workflow_not_in_runs() {
+        let mut app = App::new();
+        // "ghost" trigger has no run → workflow_names() is empty → no index to jump to
+        app.active_source_mut().apply_triggers(vec![trigger_dto("t1", "ghost", 0)]);
+        app.active_source_mut().set_view_mode(ViewMode::Triggers);
+
+        app.jump_to_workflow_view(); // should not panic
+
+        let src = app.active_source();
+        assert_eq!(src.view_mode, ViewMode::Workflows);
+        assert_eq!(src.focus, Focus::WorkflowList);
+        assert_eq!(src.selected_workflow, 0); // unchanged
+    }
+
+    #[test]
+    fn jump_to_workflow_view_from_workflow_mode_does_not_jump() {
+        let mut app = App::new();
+        let src = app.active_source_mut();
+        src.handle(started("r1", "build"));
+        src.handle(started("r2", "deploy"));
+        src.set_view_mode(ViewMode::Workflows);
+        src.selected_workflow = 1; // "build" selected
+
+        app.jump_to_workflow_view(); // W while already in Workflow mode
+
+        // selected_workflow must not change — no trigger context to jump from
+        assert_eq!(app.active_source().selected_workflow, 1);
     }
 }

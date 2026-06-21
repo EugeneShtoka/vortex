@@ -70,3 +70,81 @@ Technical Debt to Watch Out For:
   Circular Dependencies: Validation step during TOML loading to detect infinite loops in the task graph.
   Backpressure: If a trigger fires 100 times per second, the broadcast channel has a capacity limit (currently 256). Add queuing or drop-oldest strategy.
   Compound gate topo sort: when = "a AND b" only creates a dep edge on "a". Full expression analysis needed to handle multi-dep compound gates correctly.
+
+---
+
+Sprint 15 — Trigger Tracking
+Goal: Persist every incoming trigger in SQLite with full lifecycle status, giving complete visibility into what hit the system, where it came from, and why it succeeded or was rejected.
+
+## New `triggers` table
+
+```sql
+CREATE TABLE IF NOT EXISTS triggers (
+    id               TEXT PRIMARY KEY,   -- same as run_id generated on receipt
+    workflow         TEXT NOT NULL,      -- target workflow; empty string for unknown_workflow rejection
+    status           TEXT NOT NULL,      -- see TriggerStatus below
+    params           TEXT NOT NULL,      -- JSON trigger payload
+    source           TEXT NOT NULL,      -- "http" | "ntfy" | "cron" | "peer"
+    rejection_cause  TEXT,               -- "unauthorized" | "workflow_not_found" when rejected
+    remote_addr      TEXT,               -- client IP for http source; null otherwise
+    received_at      INTEGER NOT NULL,   -- unix ms when trigger hit the system
+    finished_at      INTEGER             -- unix ms when status became terminal
+);
+```
+
+## TriggerStatus enum (vortex-core)
+
+```rust
+pub enum TriggerStatus {
+    Received,   // trigger hit the system, auth not yet checked
+    Accepted,   // auth passed, workflow found, queued for execution
+    Rejected,   // denied; see rejection_cause
+    Running,    // workflow engine started
+    Finished,   // workflow completed (check runs table for outcome)
+}
+```
+
+Happy path:   Received → Accepted → Running → Finished
+Rejected path: Received → Rejected
+
+`Finished` is terminal regardless of whether the workflow succeeded or failed — the run outcome lives in the `runs` table, not here. Join on `triggers.id = runs.id` to get both.
+
+## Store methods
+
+- `insert_trigger(id, workflow, params, source, remote_addr, received_at)` — inserts row with status `Received`
+- `update_trigger_status(id, status, rejection_cause, finished_at)` — transitions status; sets `rejection_cause` on `Rejected`, `finished_at` on `Rejected`/`Finished`
+
+## Wiring (event → store call)
+
+| Event            | Store call                                                  |
+|------------------|-------------------------------------------------------------|
+| TriggerReceived  | insert_trigger (source + remote_addr injected here)         |
+| TriggerAccepted  | update_trigger_status(Accepted)                             |
+| TriggerRejected  | update_trigger_status(Rejected, rejection_cause, finished_at)|
+| WorkflowStarted  | update_trigger_status(Running)                              |
+| WorkflowFinished | update_trigger_status(Finished, finished_at)                |
+
+Server.rs and listener.rs emit TriggerReceived with `source` tag already; remote_addr extracted from axum ConnectInfo for http source.
+
+## Cleanup
+
+- Remove dead `reject_run()` from store.rs and its test
+- Remove `rejection: Option<String>` column from `runs` table and `RunRow` struct
+- Update `RunRow` status comment: `"running"|"success"|"failed"` only (rejected is now triggers-only)
+
+## New API endpoints
+
+- `GET /triggers?limit=N&offset=N` — list triggers newest-first, same shape as /runs
+- `GET /triggers/{id}` — single trigger detail
+
+## TUI
+
+- Run list: show source badge on each run row (h/n/c/p icon in a narrow column)
+- Future: dedicated triggers view showing rejected triggers (currently invisible in history)
+
+## Tests (TDD)
+
+- Store: insert_trigger, update_trigger_status for each status transition
+- Server: trigger row persisted with Accepted status on valid POST /trigger/{workflow}
+- Server: trigger row persisted with Rejected status + correct rejection_cause on bad auth / unknown workflow
+- Engine: trigger transitions to Running on WorkflowStarted, Finished on WorkflowFinished

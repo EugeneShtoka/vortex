@@ -5,28 +5,82 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::error;
 use uuid::Uuid;
 
 use crate::config::{Config, WorkflowConfig};
 use crate::engine::Engine;
 use crate::event::Event;
+use crate::store::Store;
 
-pub async fn run(config: Arc<Config>, event_tx: broadcast::Sender<Event>) {
+pub async fn run(config_rx: watch::Receiver<Arc<Config>>, event_tx: broadcast::Sender<Event>) {
+    let db_path = config_rx.borrow().server.db_path.clone();
+
+    let db_cleanup = db_path.clone();
+    tokio::spawn(async move {
+        let hour = tokio::time::Duration::from_secs(3600);
+        loop {
+            tokio::time::sleep(hour).await;
+            match Store::open(&db_cleanup) {
+                Ok(store) => {
+                    let now = vortex_core::now_ms();
+                    match store.cleanup_expired_logs(now) {
+                        Ok(n) if n > 0 => tracing::info!(deleted = n, "Cleaned up expired task logs"),
+                        Ok(_) => {}
+                        Err(e) => error!("Log cleanup failed: {e:#}"),
+                    }
+                }
+                Err(e) => error!("Log cleanup: failed to open store: {e:#}"),
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut rx = config_rx;
+        let mut handles: HashMap<String, (String, tokio::task::AbortHandle)> = HashMap::new();
+        sync_cron_tasks(&rx.borrow().clone(), &mut handles, &event_tx);
+        loop {
+            if rx.changed().await.is_err() {
+                break;
+            }
+            let config = rx.borrow().clone();
+            sync_cron_tasks(&config, &mut handles, &event_tx);
+        }
+    });
+}
+
+fn sync_cron_tasks(
+    config: &Config,
+    handles: &mut HashMap<String, (String, tokio::task::AbortHandle)>,
+    event_tx: &broadcast::Sender<Event>,
+) {
+    handles.retain(|name, (expr, handle)| {
+        let keep = config.workflows.get(name)
+            .and_then(|wf| wf.cron.as_deref())
+            .map(|new_expr| new_expr == expr.as_str())
+            .unwrap_or(false);
+        if !keep {
+            handle.abort();
+            tracing::info!(workflow = %name, "Cron task stopped");
+        }
+        keep
+    });
+
     for (name, wf) in &config.workflows {
-        let Some(expr) = wf.cron.clone() else { continue };
-        let (name, wf, tx, db) = (
+        let Some(expr) = &wf.cron else { continue };
+        if handles.contains_key(name) {
+            continue;
+        }
+        let jh = tokio::spawn(run_schedule(
             name.clone(),
             wf.clone(),
-            event_tx.clone(),
+            expr.clone(),
             config.server.db_path.clone(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = run_schedule(name.clone(), wf, expr, db, tx).await {
-                error!(workflow = %name, "Scheduler stopped: {e:#}");
-            }
-        });
+            event_tx.clone(),
+        ));
+        tracing::info!(workflow = %name, cron = %expr, "Cron task started");
+        handles.insert(name.clone(), (expr.clone(), jh.abort_handle()));
     }
 }
 

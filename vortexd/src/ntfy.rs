@@ -5,7 +5,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -29,16 +29,16 @@ struct NtfyMessage {
     tags:     Vec<String>,
 }
 
-pub async fn listen(cfg: NtfyListenerConfig, config: Arc<Config>, event_tx: broadcast::Sender<Event>) {
+pub async fn listen(cfg: NtfyListenerConfig, config_rx: watch::Receiver<Arc<Config>>, event_tx: broadcast::Sender<Event>) {
     loop {
-        if let Err(e) = stream(&cfg, &config, &event_tx).await {
+        if let Err(e) = stream(&cfg, &config_rx, &event_tx).await {
             error!(topic = %cfg.topic, "ntfy listener error: {e:#}");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
-async fn stream(cfg: &NtfyListenerConfig, config: &Arc<Config>, event_tx: &broadcast::Sender<Event>) -> Result<()> {
+async fn stream(cfg: &NtfyListenerConfig, config_rx: &watch::Receiver<Arc<Config>>, event_tx: &broadcast::Sender<Event>) -> Result<()> {
     let url = format!("{}/{}/json", cfg.server, cfg.topic);
     let mut req = Client::new().get(&url);
     if let Some(token) = resolve_token(cfg)? {
@@ -54,20 +54,21 @@ async fn stream(cfg: &NtfyListenerConfig, config: &Arc<Config>, event_tx: &broad
             let line = buf[..pos].trim().to_string();
             buf.drain(..=pos);
             if !line.is_empty() {
-                handle_line(&line, cfg, config, event_tx).await;
+                handle_line(&line, cfg, config_rx, event_tx).await;
             }
         }
     }
     Ok(())
 }
 
-async fn handle_line(line: &str, cfg: &NtfyListenerConfig, config: &Arc<Config>, event_tx: &broadcast::Sender<Event>) {
+async fn handle_line(line: &str, cfg: &NtfyListenerConfig, config_rx: &watch::Receiver<Arc<Config>>, event_tx: &broadcast::Sender<Event>) {
     let msg: NtfyMessage = match serde_json::from_str(line) {
         Ok(m) => m,
         Err(e) => { warn!(topic = %cfg.topic, "ntfy: failed to parse message: {e}"); return; }
     };
     if msg.event != "message" { return; }
 
+    let config = config_rx.borrow().clone();
     let Some(wf) = config.workflows.get(&cfg.workflow) else {
         warn!(workflow = %cfg.workflow, "ntfy: workflow not found");
         return;

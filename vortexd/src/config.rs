@@ -42,6 +42,14 @@ pub struct WorkflowConfig {
     /// correlation ID included in the response. Falls back to trigger.correlation_id
     /// → trigger.id → UUID if omitted or if the rendered value is empty.
     pub correlation_id: Option<String>,
+    /// CEL expression evaluated after all tasks finish to determine overall run
+    /// success/failure. Has access to `tasks.*`, `trigger.*`, `env.*`, `globals.*`,
+    /// `correlation_id`. When absent, the run succeeds if all non-skipped tasks succeed.
+    pub status_eval: Option<String>,
+    /// How long to retain task log lines for this workflow.
+    /// None = default (7 days), 0 = no logs, -1 = keep forever, N = N days.
+    #[serde(default)]
+    pub log_retention: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -361,6 +369,26 @@ tasks = [{ id = "run", type = "shell", exec = "backup.sh" }]
     }
 
     #[test]
+    fn parses_status_eval_on_workflow() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+
+[workflows.w]
+status_eval = "tasks.build.success"
+tasks = [{ id = "build", type = "shell", exec = "cargo build" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.workflows["w"].status_eval.as_deref(), Some("tasks.build.success"));
+    }
+
+    #[test]
+    fn status_eval_is_optional() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert!(cfg.workflows["deploy"].status_eval.is_none());
+    }
+
+    #[test]
     fn parses_spawn_task_with_args() {
         let toml = r#"
 [server]
@@ -538,5 +566,50 @@ tasks      = [
         } else {
             panic!("expected ForEach kind");
         }
+    }
+
+    #[test]
+    fn log_retention_defaults_to_none() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert!(cfg.workflows["deploy"].log_retention.is_none());
+    }
+
+    #[test]
+    fn log_retention_zero_disables_logs() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+[workflows.w]
+log_retention = 0
+tasks = [{ id = "t", type = "shell", exec = "true" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.workflows["w"].log_retention, Some(0));
+    }
+
+    #[test]
+    fn log_retention_minus_one_means_forever() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+[workflows.w]
+log_retention = -1
+tasks = [{ id = "t", type = "shell", exec = "true" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.workflows["w"].log_retention, Some(-1));
+    }
+
+    #[test]
+    fn log_retention_days_parsed() {
+        let toml = r#"
+[server]
+unix_socket = "/tmp/v.sock"
+[workflows.w]
+log_retention = 14
+tasks = [{ id = "t", type = "shell", exec = "true" }]
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.workflows["w"].log_retention, Some(14));
     }
 }

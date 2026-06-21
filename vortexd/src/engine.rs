@@ -16,30 +16,53 @@ use crate::event::Event;
 use crate::gate;
 use crate::store::Store;
 use crate::template;
+use vortex_core::{TaskStatus, TriggerStatus};
+
+// ── log retention helper ──────────────────────────────────────────────────────
+
+/// Compute the expiry timestamp for task log lines from `log_retention`.
+/// Returns `None` when logging is disabled (`log_retention = 0`).
+/// Returns `Some(None)` when logs should be kept forever (`log_retention = -1`).
+/// Returns `Some(Some(ts))` with an absolute expiry timestamp otherwise
+/// (default 7 days when `log_retention` is unset).
+pub fn log_expiry(log_retention: Option<i32>, now_ms: u64) -> Option<Option<u64>> {
+    match log_retention {
+        Some(0)  => None,
+        Some(-1) => Some(None),
+        Some(n)  => Some(Some(now_ms + n as u64 * 86_400_000)),
+        None     => Some(Some(now_ms + 7 * 86_400_000)),
+    }
+}
 
 // ── result types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct TaskResult {
-    pub id:        String,
-    pub stdout:    String,
-    pub stderr:    String,
-    pub exit_code: i32,
-    pub success:   bool,
-    pub output:    Option<serde_json::Value>,
-    pub status:    Option<u16>,
+    pub id:          String,
+    pub stdout:      String,
+    pub stderr:      String,
+    pub exit_code:   i32,
+    pub status:      TaskStatus,
+    pub output:      Option<serde_json::Value>,
+    pub http_status: Option<u16>,
     /// Rendered response_template (or Response task output). When set on the last
     /// successful task that has one, this becomes the workflow's response to the caller.
-    pub response:  Option<String>,
+    pub response:    Option<String>,
+}
+
+impl TaskResult {
+    pub fn is_success(&self) -> bool { self.status.is_success() }
+    pub fn is_failed(&self)  -> bool { self.status.is_failed()  }
+    pub fn is_skipped(&self) -> bool { self.status.is_skipped() }
 }
 
 struct TaskOutcome {
-    stdout:    String,
-    stderr:    String,
-    exit_code: i32,
-    success:   bool,
-    output:    Option<serde_json::Value>,
-    status:    Option<u16>,
+    stdout:      String,
+    stderr:      String,
+    exit_code:   i32,
+    success:     bool,
+    output:      Option<serde_json::Value>,
+    http_status: Option<u16>,
 }
 
 // ── engine ────────────────────────────────────────────────────────────────────
@@ -101,6 +124,9 @@ impl Engine {
         let store = Store::open(&self.db_path)?;
         let mut globals = store.get_all()?;
         store.insert_run(&run_id, workflow_name, &serde_json::to_string(&self.trigger_params).unwrap_or_else(|_| "{}".into()), started_at)?;
+        if let Err(e) = store.update_trigger_status(&run_id, TriggerStatus::Running, None, None) {
+            warn!("Failed to update trigger status to running: {e:#}");
+        }
 
         let all_ids: Vec<&str> = self.config.tasks.iter().map(|t| t.id.as_str()).collect();
         let mut results: HashMap<String, TaskResult> = HashMap::new();
@@ -120,14 +146,19 @@ impl Engine {
             if !self.gate_allows(task, &results, &all_ids, &globals)? {
                 warn!(task = %task.id, "Skipped (gate not met)");
                 let ts = vortex_core::now_ms();
-                store.upsert_task(&run_id, &task.id, "skipped", None, None, None, Some(ts), Some(ts))?;
                 self.emit(Event::TaskSkipped { run_id: run_id.clone(), task: task.id.clone(), timestamp: ts });
+                store.upsert_task(&run_id, &task.id, TaskStatus::Skipped, None, None, None, Some(ts), Some(ts))?;
+                all_results.push(TaskResult {
+                    id: task.id.clone(), stdout: String::new(), stderr: String::new(),
+                    exit_code: -1, status: TaskStatus::Skipped,
+                    output: None, http_status: None, response: None,
+                });
                 continue;
             }
 
             let mut result = self.run_task(task, &run_id, &results, &globals).await?;
 
-            if result.success {
+            if result.is_success() {
                 if matches!(task.kind, TaskKind::Response { .. }) {
                     // Response task: stdout IS the rendered template, promote to response
                     result.response = Some(result.stdout.clone());
@@ -141,7 +172,7 @@ impl Engine {
                 }
             }
 
-            if result.success {
+            if result.is_success() {
                 if let TaskKind::StoreSet { set } = &task.kind {
                     if let Ok(rendered) = render_map(set, &results, &globals, &self.trigger_params, &self.correlation_id) {
                         globals.extend(rendered);
@@ -166,9 +197,19 @@ impl Engine {
             if should_abort { break; }
         }
 
-        let overall_success = all_results.iter().all(|r| r.success);
+        let overall_success = if let Some(expr) = &self.config.status_eval {
+            match gate::evaluate(expr, &results, &all_ids, &self.trigger_params, &globals, &self.correlation_id) {
+                Ok(b)  => b,
+                Err(e) => { warn!("status_eval error: {e:#}"); false }
+            }
+        } else {
+            all_results.iter().filter(|r| !r.is_skipped()).all(|r| r.is_success())
+        };
         let finished_at = vortex_core::now_ms();
         store.finish_run(&run_id, overall_success, finished_at)?;
+        if let Err(e) = store.update_trigger_status(&run_id, TriggerStatus::Finished, None, Some(finished_at)) {
+            warn!("Failed to update trigger status to finished: {e:#}");
+        }
         self.emit(Event::WorkflowFinished {
             run_id,
             workflow: workflow_name.to_string(),
@@ -188,12 +229,12 @@ impl Engine {
     ) -> Result<TaskResult> {
         let started_at = vortex_core::now_ms();
         let store = Store::open(&self.db_path)?;
-        store.upsert_task(run_id, &task.id, "running", None, None, None, Some(started_at), None)?;
+        store.upsert_task(run_id, &task.id, TaskStatus::Running, None, None, None, Some(started_at), None)?;
         self.emit(Event::TaskStarted { run_id: run_id.to_string(), task: task.id.clone(), timestamp: started_at });
 
         let outcome = self.dispatch_task(task, results, globals).await.unwrap_or_else(|e| {
             error!(task = %task.id, "Task failed: {e:#}");
-            TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: -1, success: false, output: None, status: None }
+            TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: -1, success: false, output: None, http_status: None }
         });
 
         let finished_at = vortex_core::now_ms();
@@ -201,8 +242,17 @@ impl Engine {
         if !outcome.stderr.trim().is_empty() { error!(task = %task.id, "stderr: {}", outcome.stderr.trim_end()); }
         if outcome.success { info!(task = %task.id, "Finished OK") } else { warn!(task = %task.id, "Finished with error") }
 
-        let status_str = if outcome.success { "success" } else { "failure" };
-        store.upsert_task(run_id, &task.id, status_str, Some(outcome.exit_code),
+        if let Some(expires_at) = log_expiry(self.config.log_retention, finished_at) {
+            for line in outcome.stdout.lines().filter(|l| !l.is_empty()) {
+                let _ = store.insert_task_log(run_id, &task.id, "stdout", line, finished_at, expires_at);
+            }
+            for line in outcome.stderr.lines().filter(|l| !l.is_empty()) {
+                let _ = store.insert_task_log(run_id, &task.id, "stderr", line, finished_at, expires_at);
+            }
+        }
+
+        let task_status = if outcome.success { TaskStatus::Success } else { TaskStatus::Failed };
+        store.upsert_task(run_id, &task.id, task_status, Some(outcome.exit_code),
             Some(&outcome.stdout), Some(&outcome.stderr), Some(started_at), Some(finished_at))?;
         self.emit(Event::TaskFinished {
             run_id: run_id.to_string(), task: task.id.clone(),
@@ -211,8 +261,12 @@ impl Engine {
             timestamp: finished_at,
         });
 
-        Ok(TaskResult { id: task.id.clone(), stdout: outcome.stdout, stderr: outcome.stderr,
-            exit_code: outcome.exit_code, success: outcome.success, output: outcome.output, status: outcome.status, response: None })
+        Ok(TaskResult {
+            id: task.id.clone(), stdout: outcome.stdout, stderr: outcome.stderr,
+            exit_code: outcome.exit_code,
+            status: if outcome.success { TaskStatus::Success } else { TaskStatus::Failed },
+            output: outcome.output, http_status: outcome.http_status, response: None,
+        })
     }
 
     async fn dispatch_task(
@@ -266,7 +320,14 @@ impl Engine {
                     .collect::<Result<_>>()?;
                 execute_store_set(rendered, &self.db_path).await
             }
-            TaskKind::Peer { .. } => bail!("Peer tasks not yet implemented (Sprint 14)"),
+            TaskKind::Peer { vortex, trigger, params } => {
+                let socket  = render(vortex)?;
+                let wf      = render(trigger)?;
+                let params: HashMap<String, String> = params.iter()
+                    .map(|(k, v)| render(v).map(|v| (k.clone(), v)))
+                    .collect::<Result<_>>()?;
+                execute_peer(&task.id, &socket, &wf, &params).await
+            }
             TaskKind::Spawn { exe, args } => {
                 let exe  = render(exe)?;
                 let args = args.iter().map(|a| render(a)).collect::<Result<Vec<_>>>()?;
@@ -276,7 +337,7 @@ impl Engine {
                 let rendered = render(template)?;
                 Ok(TaskOutcome {
                     stdout: rendered, stderr: String::new(),
-                    exit_code: 0, success: true, output: None, status: None,
+                    exit_code: 0, success: true, output: None, http_status: None,
                 })
             }
             TaskKind::Condition { expr } => {
@@ -286,9 +347,9 @@ impl Engine {
                     .map(|v| vec![("item", v)])
                     .unwrap_or_default();
                 match gate::evaluate_with_extras(expr, results, &all_ids, &self.trigger_params, globals, cid, &extras) {
-                    Ok(true)  => Ok(TaskOutcome { stdout: "true".into(),  stderr: String::new(), exit_code: 0, success: true,  output: None, status: None }),
-                    Ok(false) => Ok(TaskOutcome { stdout: "false".into(), stderr: String::new(), exit_code: 1, success: false, output: None, status: None }),
-                    Err(e)    => Ok(TaskOutcome { stdout: String::new(),  stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
+                    Ok(true)  => Ok(TaskOutcome { stdout: "true".into(),  stderr: String::new(), exit_code: 0, success: true,  output: None, http_status: None }),
+                    Ok(false) => Ok(TaskOutcome { stdout: "false".into(), stderr: String::new(), exit_code: 1, success: false, output: None, http_status: None }),
+                    Err(e)    => Ok(TaskOutcome { stdout: String::new(),  stderr: e.to_string(), exit_code: 2, success: false, output: None, http_status: None }),
                 }
             }
             TaskKind::Eval { expr } => {
@@ -299,7 +360,7 @@ impl Engine {
                     .unwrap_or_default();
                 match gate::evaluate_value_with_extras(expr, results, &all_ids, &self.trigger_params, globals, cid, &extras) {
                     Ok(value) => Ok(cel_to_outcome(value)),
-                    Err(e)    => Ok(TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: 2, success: false, output: None, status: None }),
+                    Err(e)    => Ok(TaskOutcome { stdout: String::new(), stderr: e.to_string(), exit_code: 2, success: false, output: None, http_status: None }),
                 }
             }
             TaskKind::ForEach { items, tasks, initial, accumulate } => {
@@ -368,21 +429,23 @@ impl Engine {
             if !allowed {
                 results.insert(task.id.clone(), TaskResult {
                     id: task.id.clone(), stdout: String::new(), stderr: String::new(),
-                    exit_code: 1, success: false, output: None, status: None, response: None,
+                    exit_code: -1, status: TaskStatus::Skipped,
+                    output: None, http_status: None, response: None,
                 });
                 continue;
             }
             let outcome = self.dispatch_task_inner(task, &results, globals, Some(&item_json)).await
                 .unwrap_or_else(|e| TaskOutcome {
                     stdout: String::new(), stderr: e.to_string(),
-                    exit_code: -1, success: false, output: None, status: None,
+                    exit_code: -1, success: false, output: None, http_status: None,
                 });
             let success = outcome.success;
             results.insert(task.id.clone(), TaskResult {
                 id: task.id.clone(),
                 stdout: outcome.stdout, stderr: outcome.stderr,
-                exit_code: outcome.exit_code, success: outcome.success,
-                output: outcome.output, status: outcome.status, response: None,
+                exit_code: outcome.exit_code,
+                status: if outcome.success { TaskStatus::Success } else { TaskStatus::Failed },
+                output: outcome.output, http_status: outcome.http_status, response: None,
             });
             if !success {
                 bail!("foreach inner task '{}' failed", task.id);
@@ -489,7 +552,7 @@ async fn execute_spawn(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code().unwrap_or(-1);
-    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, status: None })
+    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, http_status: None })
 }
 
 async fn execute_shell(task_id: &str, exec: &str, trigger_params: &HashMap<String, String>) -> Result<TaskOutcome> {
@@ -501,7 +564,7 @@ async fn execute_shell(task_id: &str, exec: &str, trigger_params: &HashMap<Strin
     let stdout    = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr    = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code().unwrap_or(-1);
-    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, status: None })
+    Ok(TaskOutcome { stdout, stderr, exit_code, success: output.status.success(), output: None, http_status: None })
 }
 
 async fn execute_http(method: &str, url: &str, headers: &HashMap<String, String>, body: Option<&str>) -> Result<TaskOutcome> {
@@ -517,7 +580,7 @@ async fn execute_http(method: &str, url: &str, headers: &HashMap<String, String>
     Ok(TaskOutcome {
         stdout: body_text, stderr: String::new(),
         exit_code: http_status.as_u16() as i32, success: http_status.is_success(),
-        output: parsed, status: Some(http_status.as_u16()),
+        output: parsed, http_status: Some(http_status.as_u16()),
     })
 }
 
@@ -536,19 +599,69 @@ async fn execute_email(to: &str, subject: &str, body: &str, cc: Option<&str>, cf
             .credentials(creds)
             .build();
     mailer.send(email).await?;
-    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, http_status: None })
 }
 
 async fn execute_sleep(duration: &str) -> Result<TaskOutcome> {
     let d = parse_duration(duration)?;
     tokio::time::sleep(d).await;
-    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, http_status: None })
 }
 
 async fn execute_store_set(set: HashMap<String, String>, db_path: &str) -> Result<TaskOutcome> {
     let store = Store::open(db_path)?;
     for (k, v) in &set { store.set(k, v)?; }
-    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, status: None })
+    Ok(TaskOutcome { stdout: String::new(), stderr: String::new(), exit_code: 0, success: true, output: None, http_status: None })
+}
+
+async fn execute_peer(
+    task_id: &str,
+    socket_path: &str,
+    workflow: &str,
+    params: &HashMap<String, String>,
+) -> Result<TaskOutcome> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    info!(task = %task_id, peer = %socket_path, workflow = %workflow, "Running peer task");
+
+    let mut stream = UnixStream::connect(socket_path).await
+        .map_err(|e| anyhow::anyhow!("peer task: failed to connect to {socket_path}: {e}"))?;
+
+    let request = serde_json::json!({"workflow": workflow, "params": params});
+    let mut payload = serde_json::to_string(&request)?;
+    payload.push('\n');
+
+    let (read_half, mut write_half) = stream.split();
+    write_half.write_all(payload.as_bytes()).await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let line = line.trim().to_string();
+
+    if line.is_empty() {
+        bail!("peer task: no response from {socket_path}");
+    }
+
+    let resp: serde_json::Value = serde_json::from_str(&line)
+        .map_err(|e| anyhow::anyhow!("peer task: invalid JSON response: {e}"))?;
+
+    let is_error = resp.get("status").and_then(|s| s.as_str()) == Some("error");
+    let stderr = if is_error {
+        resp.get("message").and_then(|m| m.as_str()).unwrap_or("peer trigger failed").to_string()
+    } else {
+        String::new()
+    };
+
+    Ok(TaskOutcome {
+        stdout: line,
+        stderr,
+        exit_code: if is_error { 1 } else { 0 },
+        success: !is_error,
+        output: Some(resp),
+        http_status: None,
+    })
 }
 
 
@@ -558,15 +671,15 @@ fn cel_to_outcome(value: CelValue) -> TaskOutcome {
     match value {
         CelValue::String(s) => {
             let s = s.as_ref().clone();
-            TaskOutcome { stdout: s, stderr: String::new(), exit_code, success, output: None, status: None }
+            TaskOutcome { stdout: s, stderr: String::new(), exit_code, success, output: None, http_status: None }
         }
         CelValue::Bool(b) => {
-            TaskOutcome { stdout: if b { "true" } else { "false" }.into(), stderr: String::new(), exit_code, success, output: Some(serde_json::Value::Bool(b)), status: None }
+            TaskOutcome { stdout: if b { "true" } else { "false" }.into(), stderr: String::new(), exit_code, success, output: Some(serde_json::Value::Bool(b)), http_status: None }
         }
         other => {
             let json = cel_to_json(&other);
             let stdout = json.to_string();
-            TaskOutcome { stdout, stderr: String::new(), exit_code, success, output: Some(json), status: None }
+            TaskOutcome { stdout, stderr: String::new(), exit_code, success, output: Some(json), http_status: None }
         }
     }
 }
@@ -635,7 +748,7 @@ mod tests {
     }
 
     fn workflow(tasks: Vec<TaskConfig>) -> WorkflowConfig {
-        WorkflowConfig { tasks, cron: None, correlation_id: None }
+        WorkflowConfig { tasks, cron: None, correlation_id: None, status_eval: None, log_retention: None }
     }
 
     fn engine(tasks: Vec<TaskConfig>) -> Engine {
@@ -644,7 +757,12 @@ mod tests {
     }
 
     fn tr(id: &str, success: bool) -> TaskResult {
-        TaskResult { id: id.into(), stdout: String::new(), stderr: String::new(), exit_code: if success { 0 } else { 1 }, success, output: None, status: None, response: None }
+        TaskResult {
+            id: id.into(), stdout: String::new(), stderr: String::new(),
+            exit_code: if success { 0 } else { 1 },
+            status: if success { TaskStatus::Success } else { TaskStatus::Failed },
+            output: None, http_status: None, response: None,
+        }
     }
 
     // --- topological sort ---
@@ -742,8 +860,8 @@ mod tests {
         let e = engine(vec![task("step1", "echo hello", None), task("step2", "echo world", Some("step1"))]);
         let results = e.run("test-workflow").await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results[0].success);
-        assert!(results[1].success);
+        assert!(results[0].is_success());
+        assert!(results[1].is_success());
         assert!(results[0].stdout.contains("hello"));
         assert!(results[1].stdout.contains("world"));
     }
@@ -756,11 +874,10 @@ mod tests {
             task("run_me",    "echo recovery",       Some("NOT fail_step")),
         ]);
         let results = e.run("test-workflow").await.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, "fail_step");
-        assert!(!results[0].success);
-        assert_eq!(results[1].id, "run_me");
-        assert!(results[1].success);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().any(|r| r.id == "fail_step" && r.is_failed()));
+        assert!(results.iter().any(|r| r.id == "skip_me"   && r.is_skipped()));
+        assert!(results.iter().any(|r| r.id == "run_me"    && r.is_success()));
     }
 
     #[tokio::test]
@@ -777,7 +894,7 @@ mod tests {
     async fn run_and_gate_skips_if_either_fails() {
         let e = engine(vec![task("a", "echo a", None), task("b", "exit 1", None), task("c", "echo c", Some("a AND b"))]);
         let results = e.run("test-workflow").await.unwrap();
-        assert!(!results.iter().any(|r| r.id == "c"));
+        assert!(results.iter().any(|r| r.id == "c" && r.is_skipped()));
     }
 
     // --- events ---
@@ -849,7 +966,7 @@ mod tests {
         e.run("wf").await.unwrap();
         let s = Store::open(&db).unwrap();
         let run = s.get_run("hist-3").unwrap().unwrap();
-        assert_eq!(run.run.status, "failure");
+        assert_eq!(run.run.status, "failed");
         let skip_task = run.tasks.iter().find(|t| t.task_id == "skip").unwrap();
         assert_eq!(skip_task.status, "skipped");
     }
@@ -864,8 +981,8 @@ mod tests {
             task("on_0",  "echo not_matched", Some("tasks.build.exit_code == 0")),
         ]);
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "on_42" && r.success));
-        assert!(!results.iter().any(|r| r.id == "on_0"));
+        assert!(results.iter().any(|r| r.id == "on_42" && r.is_success()));
+        assert!(results.iter().any(|r| r.id == "on_0"  && r.is_skipped()));
     }
 
     #[tokio::test]
@@ -876,8 +993,8 @@ mod tests {
             task("nomatch","echo no",    Some("tasks.step.stdout == \"other\"")),
         ]);
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "match" && r.success));
-        assert!(!results.iter().any(|r| r.id == "nomatch"));
+        assert!(results.iter().any(|r| r.id == "match"   && r.is_success()));
+        assert!(results.iter().any(|r| r.id == "nomatch" && r.is_skipped()));
     }
 
     #[tokio::test]
@@ -886,7 +1003,7 @@ mod tests {
             task("notify", "echo ok", Some("trigger.event_id == \"\"")),
         ]).with_params(HashMap::from([("event_id".into(), "".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "notify" && r.success));
+        assert!(results.iter().any(|r| r.id == "notify" && r.is_success()));
     }
 
     #[tokio::test]
@@ -895,7 +1012,7 @@ mod tests {
             task("notify", "echo ok", Some("trigger.event_id == \"\"")),
         ]).with_params(HashMap::from([("event_id".into(), "$abc:server".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(!results.iter().any(|r| r.id == "notify"));
+        assert!(results.iter().any(|r| r.id == "notify" && r.is_skipped()));
     }
 
     // --- Sprint 13: new task types ---
@@ -909,7 +1026,7 @@ mod tests {
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].success);
+        assert!(results[0].is_success());
     }
 
     #[tokio::test]
@@ -923,7 +1040,7 @@ mod tests {
         let e = Engine::new(wf, &db);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results[1].success);
+        assert!(results[1].is_success());
         assert!(results[1].stdout.contains("hello"));
     }
 
@@ -950,7 +1067,7 @@ mod tests {
         }]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert!(results[0].stdout.contains("hello world"));
     }
 
@@ -962,7 +1079,7 @@ mod tests {
             when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].exit_code, 0);
     }
 
@@ -974,7 +1091,7 @@ mod tests {
             when: None, depends_on: None, response_template: None, abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_ne!(results[0].exit_code, 0);
     }
 
@@ -987,7 +1104,7 @@ mod tests {
             when: None, depends_on: None, response_template: None, abort_if: None,
         }]).with_params(HashMap::from([("Body".into(), "hello".into()), ("Sender".into(), "@user".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         let out: serde_json::Value = serde_json::from_str(&results[0].stdout).unwrap();
         assert_eq!(out["Body"], "hello");
         assert_eq!(out["Sender"], "@user");
@@ -1000,8 +1117,8 @@ mod tests {
             TaskConfig { id: "action".into(), kind: TaskKind::Shell { exec: "echo done".into() }, when: Some("filter".into()), depends_on: None, response_template: None, abort_if: None },
         ]);
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "filter" && !r.success));
-        assert!(!results.iter().any(|r| r.id == "action"));
+        assert!(results.iter().any(|r| r.id == "filter" && r.is_failed()));
+        assert!(results.iter().any(|r| r.id == "action" && r.is_skipped()));
     }
 
     // --- Response task kind ---
@@ -1021,7 +1138,7 @@ mod tests {
         ]);
         let results = e.run("test").await.unwrap();
         let r = results.iter().find(|r| r.id == "reply").unwrap();
-        assert!(r.success);
+        assert!(r.is_success());
         assert!(r.stdout.contains("got=world"));
     }
 
@@ -1066,7 +1183,7 @@ mod tests {
             abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert!(results[0].response.as_deref().unwrap_or("").contains("wrapped=raw"));
     }
 
@@ -1081,7 +1198,7 @@ mod tests {
             abort_if: None,
         }]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert!(results[0].response.is_none());
     }
 
@@ -1109,7 +1226,7 @@ mod tests {
         let e = engine(vec![check, task("work", "echo should_not_run", Some("check"))]);
         let results = e.run("test").await.unwrap();
         assert_eq!(results.len(), 1, "only check ran");
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].id, "check");
     }
 
@@ -1120,8 +1237,9 @@ mod tests {
         // check fails → abort_if = false → work is gated on "check" which failed → skipped
         let e = engine(vec![check, task("work", "echo done", Some("check"))]);
         let results = e.run("test").await.unwrap();
-        assert_eq!(results.len(), 1, "check ran; work skipped by gate");
-        assert_eq!(results[0].id, "check");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r.id == "check" && r.is_failed()));
+        assert!(results.iter().any(|r| r.id == "work"  && r.is_skipped()));
     }
 
     #[tokio::test]
@@ -1145,7 +1263,7 @@ mod tests {
         let e = engine(vec![eval("find", "\"friends\"")])
             .with_params(HashMap::new());
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].exit_code, 0);
         assert_eq!(results[0].stdout.trim(), "friends");
         assert!(results[0].output.is_none());
@@ -1155,7 +1273,7 @@ mod tests {
     async fn eval_bool_true_succeeds() {
         let e = engine(vec![eval("c", "true")]);
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].exit_code, 0);
         assert_eq!(results[0].stdout.trim(), "true");
     }
@@ -1164,7 +1282,7 @@ mod tests {
     async fn eval_bool_false_fails() {
         let e = engine(vec![eval("c", "false")]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_eq!(results[0].exit_code, 1);
         assert_eq!(results[0].stdout.trim(), "false");
     }
@@ -1173,7 +1291,7 @@ mod tests {
     async fn eval_empty_string_fails() {
         let e = engine(vec![eval("c", "\"\"")]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_eq!(results[0].exit_code, 1);
     }
 
@@ -1182,7 +1300,7 @@ mod tests {
         // invalid CEL → compile error
         let e = engine(vec![eval("c", "this is not valid $$$ cel")]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_eq!(results[0].exit_code, 2);
         assert!(!results[0].stderr.is_empty());
     }
@@ -1192,7 +1310,7 @@ mod tests {
         let e = engine(vec![eval("find", "trigger.space")])
             .with_params(HashMap::from([("space".into(), "friends".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].stdout.trim(), "friends");
     }
 
@@ -1204,9 +1322,9 @@ mod tests {
             task("skip",   "echo skipped",  Some("NOT find_space")),
         ]).with_params(HashMap::from([("room".into(), "!abc:server".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(results.iter().any(|r| r.id == "find_space" && r.success && r.stdout.trim() == "friends"));
-        assert!(results.iter().any(|r| r.id == "notify" && r.success));
-        assert!(!results.iter().any(|r| r.id == "skip"));
+        assert!(results.iter().any(|r| r.id == "find_space" && r.is_success() && r.stdout.trim() == "friends"));
+        assert!(results.iter().any(|r| r.id == "notify" && r.is_success()));
+        assert!(results.iter().any(|r| r.id == "skip"   && r.is_skipped()));
     }
 
     #[tokio::test]
@@ -1229,7 +1347,7 @@ mod tests {
     async fn condition_true_expr_succeeds_with_exit_code_0() {
         let e = engine(vec![condition("c", "true")]);
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
         assert_eq!(results[0].exit_code, 0);
         assert_eq!(results[0].stdout.trim(), "true");
     }
@@ -1238,7 +1356,7 @@ mod tests {
     async fn condition_false_expr_fails_with_exit_code_1() {
         let e = engine(vec![condition("c", "false")]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_eq!(results[0].exit_code, 1);
         assert_eq!(results[0].stdout.trim(), "false");
     }
@@ -1248,7 +1366,7 @@ mod tests {
         // "42" is valid CEL but returns Int, not Bool → gate returns Err → exit_code 2
         let e = engine(vec![condition("c", "42")]);
         let results = e.run("test").await.unwrap();
-        assert!(!results[0].success);
+        assert!(results[0].is_failed());
         assert_eq!(results[0].exit_code, 2);
         assert!(!results[0].stderr.is_empty());
     }
@@ -1258,7 +1376,7 @@ mod tests {
         let e = engine(vec![condition("c", "trigger.x == \"yes\"")])
             .with_params(HashMap::from([("x".into(), "yes".into())]));
         let results = e.run("test").await.unwrap();
-        assert!(results[0].success);
+        assert!(results[0].is_success());
     }
 
     #[tokio::test]
@@ -1269,8 +1387,8 @@ mod tests {
             task("on_other", "echo other", Some("NOT is_even")),
         ]).with_params(HashMap::from([("n".into(), "2".into())]));
         let results = e.run("test").await.unwrap();
-        assert!( results.iter().any(|r| r.id == "on_even"  && r.success));
-        assert!(!results.iter().any(|r| r.id == "on_other"));
+        assert!(results.iter().any(|r| r.id == "on_even"  && r.is_success()));
+        assert!(results.iter().any(|r| r.id == "on_other" && r.is_skipped()));
     }
 
     // --- ForEach task ---
@@ -1302,7 +1420,7 @@ mod tests {
         let results = e.run("test").await.unwrap();
         std::env::remove_var("VORTEX_TEST_ITEMS");
         let r = results.iter().find(|r| r.id == "loop").unwrap();
-        assert!(r.success);
+        assert!(r.is_success());
         let out: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
         assert_eq!(out.as_array().unwrap().len(), 3);
     }
@@ -1321,7 +1439,7 @@ mod tests {
         let results = e.run("test").await.unwrap();
         std::env::remove_var("VORTEX_TEST_SPACES");
         let r = results.iter().find(|r| r.id == "loop").unwrap();
-        assert!(r.success);
+        assert!(r.is_success());
     }
 
     #[tokio::test]
@@ -1337,7 +1455,7 @@ mod tests {
         let results = e.run("test").await.unwrap();
         std::env::remove_var("VORTEX_TEST_EMPTY");
         let r = results.iter().find(|r| r.id == "loop").unwrap();
-        assert!(r.success);
+        assert!(r.is_success());
         assert_eq!(r.stdout.trim(), "done");
     }
 
@@ -1354,7 +1472,7 @@ mod tests {
         let results = e.run("test").await.unwrap();
         std::env::remove_var("VORTEX_TEST_ONE");
         let r = results.iter().find(|r| r.id == "loop").unwrap();
-        assert!(!r.success);
+        assert!(r.is_failed());
     }
 
     #[tokio::test]
@@ -1378,8 +1496,347 @@ mod tests {
         std::env::remove_var("VORTEX_TEST_OUTER");
         std::env::remove_var("VORTEX_TEST_INNER");
         let r = results.iter().find(|r| r.id == "outer_loop").unwrap();
-        assert!(r.success);
+        assert!(r.is_success());
         let out: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
         assert_eq!(out.as_array().unwrap().len(), 4);
+    }
+
+    // --- status_eval ---
+
+    fn workflow_with_status_eval(tasks: Vec<TaskConfig>, expr: &str) -> WorkflowConfig {
+        WorkflowConfig { tasks, cron: None, correlation_id: None, status_eval: Some(expr.into()), log_retention: None }
+    }
+
+    #[tokio::test]
+    async fn status_eval_can_override_failure_to_success() {
+        // build fails, but status_eval says success = tasks.check.success (a different task)
+        let e = {
+            let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+            Engine::new(
+                workflow_with_status_eval(
+                    vec![task("check", "true", None), task("build", "exit 1", Some("check"))],
+                    "tasks.check.success",
+                ),
+                path.to_str().unwrap(),
+            )
+        };
+        let results = e.run("test").await.unwrap();
+        // build failed, but overall run should be success because check succeeded
+        assert!(results.iter().any(|r| r.id == "build" && r.is_failed()));
+        let store_path = e.db_path.clone();
+        let _s = Store::open(&store_path).unwrap();
+        // run_id is unknown here; verify via overall results only
+        // overall_success = true because status_eval = tasks.check.success = true
+        // We verify by checking the WorkflowFinished event via a channel
+        let (tx, mut rx) = broadcast::channel(32);
+        let path2 = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let e2 = Engine::new(
+            workflow_with_status_eval(
+                vec![task("check", "true", None), task("build", "exit 1", Some("check"))],
+                "tasks.check.success",
+            ),
+            path2.to_str().unwrap(),
+        ).with_events(tx).with_run_id("se-1".into());
+        e2.run("test").await.unwrap();
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert!(events.iter().any(|e| matches!(e, Event::WorkflowFinished { success: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn status_eval_can_override_success_to_failure() {
+        let (tx, mut rx) = broadcast::channel(32);
+        let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let e = Engine::new(
+            workflow_with_status_eval(vec![task("ok", "true", None)], "false"),
+            path.to_str().unwrap(),
+        ).with_events(tx).with_run_id("se-2".into());
+        e.run("test").await.unwrap();
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert!(events.iter().any(|e| matches!(e, Event::WorkflowFinished { success: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn status_eval_error_means_failure() {
+        let (tx, mut rx) = broadcast::channel(32);
+        let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let e = Engine::new(
+            workflow_with_status_eval(vec![task("ok", "true", None)], "this is $$$ not valid cel"),
+            path.to_str().unwrap(),
+        ).with_events(tx).with_run_id("se-3".into());
+        e.run("test").await.unwrap();
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert!(events.iter().any(|e| matches!(e, Event::WorkflowFinished { success: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn status_eval_absent_ignores_skipped_tasks() {
+        // fail_step fails → skip_me gets skipped → overall should still be failure (fail_step failed)
+        let e = engine(vec![
+            task("fail_step", "exit 1", None),
+            task("skip_me", "echo hi", Some("fail_step")),
+        ]);
+        let (tx, mut rx) = broadcast::channel(32);
+        let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let e2 = Engine::new(workflow(vec![
+            task("fail_step", "exit 1", None),
+            task("skip_me", "echo hi", Some("fail_step")),
+        ]), path.to_str().unwrap()).with_events(tx).with_run_id("se-4".into());
+        e2.run("test").await.unwrap();
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert!(events.iter().any(|e| matches!(e, Event::WorkflowFinished { success: false, .. })));
+        drop(e);
+    }
+
+    #[tokio::test]
+    async fn status_eval_absent_all_pass_is_success() {
+        let (tx, mut rx) = broadcast::channel(32);
+        let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let e = Engine::new(workflow(vec![task("ok", "true", None)]), path.to_str().unwrap())
+            .with_events(tx).with_run_id("se-5".into());
+        e.run("test").await.unwrap();
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        assert!(events.iter().any(|e| matches!(e, Event::WorkflowFinished { success: true, .. })));
+    }
+
+    // --- task log writing ---
+
+    fn engine_with_retention(tasks: Vec<TaskConfig>, log_retention: Option<i32>) -> (Engine, String) {
+        let path = std::env::temp_dir().join(format!("vortex-test-{}.db", uuid::Uuid::new_v4()));
+        let db = path.to_str().unwrap().to_string();
+        let mut wf = workflow(tasks);
+        wf.log_retention = log_retention;
+        (Engine::new(wf, &db).with_run_id("log-run".into()), db)
+    }
+
+    #[tokio::test]
+    async fn task_logs_written_after_shell_task() {
+        let (e, db) = engine_with_retention(vec![task("greet", "echo hello world", None)], None);
+        e.run("wf").await.unwrap();
+        let store = Store::open(&db).unwrap();
+        let logs = store.get_task_logs("log-run", "greet").unwrap();
+        assert!(!logs.is_empty());
+        assert!(logs.iter().any(|l| l.line.contains("hello world")));
+        assert!(logs.iter().all(|l| l.stream == "stdout"));
+    }
+
+    #[tokio::test]
+    async fn task_logs_not_written_when_retention_zero() {
+        let (e, db) = engine_with_retention(vec![task("greet", "echo hi", None)], Some(0));
+        e.run("wf").await.unwrap();
+        let store = Store::open(&db).unwrap();
+        let logs = store.get_task_logs("log-run", "greet").unwrap();
+        assert!(logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_logs_expiry_set_from_retention_days() {
+        let (e, db) = engine_with_retention(vec![task("step", "echo hi", None)], Some(3));
+        let before = vortex_core::now_ms();
+        e.run("wf").await.unwrap();
+        let after = vortex_core::now_ms();
+        let store = Store::open(&db).unwrap();
+        let logs = store.get_task_logs("log-run", "step").unwrap();
+        assert!(!logs.is_empty());
+        // expires_at is set; query raw to check
+        let exp: Option<i64> = store.conn.query_row(
+            "SELECT expires_at FROM task_logs WHERE run_id = 'log-run' AND task_id = 'step' LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        let exp = exp.unwrap() as u64;
+        let expected_min = before + 3 * 86_400_000;
+        let expected_max = after  + 3 * 86_400_000;
+        assert!(exp >= expected_min && exp <= expected_max);
+    }
+
+    #[tokio::test]
+    async fn task_logs_no_expiry_when_retention_minus_one() {
+        let (e, db) = engine_with_retention(vec![task("step", "echo hi", None)], Some(-1));
+        e.run("wf").await.unwrap();
+        let store = Store::open(&db).unwrap();
+        let exp: Option<i64> = store.conn.query_row(
+            "SELECT expires_at FROM task_logs WHERE run_id = 'log-run' AND task_id = 'step' LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(exp.is_none(), "expires_at should be NULL for log_retention = -1");
+    }
+
+    // --- log_expiry helper ---
+
+    #[test]
+    fn log_expiry_none_retention_gives_7_day_default() {
+        let now = 1_000_000u64;
+        let exp = super::log_expiry(None, now);
+        assert_eq!(exp, Some(Some(now + 7 * 86_400_000)));
+    }
+
+    #[test]
+    fn log_expiry_zero_disables_logging() {
+        assert_eq!(super::log_expiry(Some(0), 1000), None);
+    }
+
+    #[test]
+    fn log_expiry_minus_one_keeps_forever() {
+        assert_eq!(super::log_expiry(Some(-1), 1000), Some(None));
+    }
+
+    #[test]
+    fn log_expiry_n_days_computes_correctly() {
+        let now = 0u64;
+        assert_eq!(super::log_expiry(Some(14), now), Some(Some(14 * 86_400_000)));
+    }
+
+    // --- peer tasks ---
+
+    fn peer_task(id: &str, vortex: &str, trigger: &str, params: HashMap<String, String>) -> TaskConfig {
+        TaskConfig {
+            id: id.into(),
+            kind: TaskKind::Peer { vortex: vortex.into(), trigger: trigger.into(), params },
+            when: None, depends_on: None, response_template: None, abort_if: None,
+        }
+    }
+
+    /// Spawn a one-shot mock Unix socket listener that reads one line and writes `response`.
+    /// Returns the socket path. The listener task runs in the background.
+    async fn mock_peer(response: &'static str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        drop(tmp); // release the file so we can bind the socket
+
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+        });
+
+        path
+    }
+
+    /// Like `mock_peer` but captures the received request for inspection.
+    async fn mock_peer_capture(response: &'static str) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        drop(tmp);
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let _ = tx.send(line.trim().to_string());
+            write.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+        });
+
+        (path, rx)
+    }
+
+    #[tokio::test]
+    async fn peer_task_succeeds_on_ok_response() {
+        let path = mock_peer(r#"{"id":"run-42"}"#).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let e = engine(vec![peer_task("call", &path, "greet", HashMap::new())]);
+        let results = e.run("test-wf").await.unwrap();
+        assert!(results[0].is_success());
+        assert!(results[0].stdout.contains("run-42"));
+        assert_eq!(results[0].output.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_str()), Some("run-42"));
+    }
+
+    #[tokio::test]
+    async fn peer_task_fails_on_error_response() {
+        let path = mock_peer(r#"{"id":"x","status":"error","message":"unknown workflow: no-such"}"#).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let e = engine(vec![peer_task("call", &path, "no-such", HashMap::new())]);
+        let results = e.run("test-wf").await.unwrap();
+        assert!(results[0].is_failed());
+        assert_eq!(results[0].exit_code, 1);
+        assert!(results[0].stderr.contains("unknown workflow"));
+    }
+
+    #[tokio::test]
+    async fn peer_task_sends_workflow_and_params() {
+        let (path, rx) = mock_peer_capture(r#"{"id":"r1"}"#).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let params = HashMap::from([("env".into(), "prod".into()), ("branch".into(), "main".into())]);
+        let e = engine(vec![peer_task("call", &path, "deploy", params)]);
+        e.run("test-wf").await.unwrap();
+
+        let raw = rx.await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(req["workflow"], "deploy");
+        assert_eq!(req["params"]["env"], "prod");
+        assert_eq!(req["params"]["branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn peer_task_templates_are_rendered_in_vortex_and_trigger() {
+        let (path, rx) = mock_peer_capture(r#"{"id":"r1"}"#).await;
+        let path_tmpl = format!("{path}"); // used verbatim, but trigger uses a template
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // trigger field uses a trigger param template
+        let e = engine(vec![peer_task("call", &path_tmpl, "deploy-{{trigger.env}}", HashMap::new())])
+            .with_params(HashMap::from([("env".into(), "staging".into())]));
+        e.run("test-wf").await.unwrap();
+
+        let raw = rx.await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(req["workflow"], "deploy-staging");
+    }
+
+    #[tokio::test]
+    async fn peer_task_params_values_are_rendered() {
+        let (path, rx) = mock_peer_capture(r#"{"id":"r1"}"#).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let params = HashMap::from([("target".into(), "{{trigger.host}}".into())]);
+        let e = engine(vec![peer_task("call", &path, "ping", params)])
+            .with_params(HashMap::from([("host".into(), "db.prod".into())]));
+        e.run("test-wf").await.unwrap();
+
+        let raw = rx.await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(req["params"]["target"], "db.prod");
+    }
+
+    #[tokio::test]
+    async fn peer_task_gates_downstream_on_failure() {
+        let path = mock_peer(r#"{"id":"x","status":"error","message":"nope"}"#).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let e = engine(vec![
+            peer_task("call", &path, "deploy", HashMap::new()),
+            task("on_success", "echo should_skip", Some("call")),
+            task("on_failure", "echo ran",          Some("NOT call")),
+        ]);
+        let results = e.run("test-wf").await.unwrap();
+        assert!(results.iter().any(|r| r.id == "on_success" && r.is_skipped()));
+        assert!(results.iter().any(|r| r.id == "on_failure" && r.is_success()));
+    }
+
+    #[tokio::test]
+    async fn peer_task_fails_when_socket_not_found() {
+        let e = engine(vec![peer_task("call", "/tmp/no-such-vortex.sock", "deploy", HashMap::new())]);
+        let results = e.run("test-wf").await.unwrap();
+        assert!(results[0].is_failed());
     }
 }

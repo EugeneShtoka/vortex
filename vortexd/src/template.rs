@@ -5,6 +5,7 @@ use handlebars::{Context, Handlebars, Helper, HelperDef, HelperResult, Output, R
 use serde_json::{json, Map, Value};
 
 use crate::engine::TaskResult;
+use vortex_core::TaskStatus;
 
 struct JsonHelper;
 
@@ -58,10 +59,10 @@ pub fn render(
             json!({
                 "stdout":    r.stdout,
                 "stderr":    r.stderr,
-                "success":   r.success,
+                "success":   r.is_success(),
                 "exit_code": r.exit_code,
                 "output":    r.output,
-                "status":    r.status,
+                "http_status": r.http_status,
             }),
         );
     }
@@ -107,10 +108,10 @@ pub fn render_with_item(
             json!({
                 "stdout":    r.stdout,
                 "stderr":    r.stderr,
-                "success":   r.success,
+                "success":   r.is_success(),
                 "exit_code": r.exit_code,
                 "output":    r.output,
-                "status":    r.status,
+                "http_status": r.http_status,
             }),
         );
     }
@@ -141,7 +142,11 @@ mod tests {
     use super::*;
 
     fn result(id: &str, stdout: &str, stderr: &str, success: bool, exit_code: i32) -> TaskResult {
-        TaskResult { id: id.into(), stdout: stdout.into(), stderr: stderr.into(), exit_code, success, output: None, status: None, response: None }
+        TaskResult {
+            id: id.into(), stdout: stdout.into(), stderr: stderr.into(), exit_code,
+            status: if success { TaskStatus::Success } else { TaskStatus::Failed },
+            output: None, http_status: None, response: None,
+        }
     }
 
     fn results(items: &[TaskResult]) -> HashMap<String, TaskResult> {
@@ -264,9 +269,9 @@ mod tests {
     #[test]
     fn task_status_substituted() {
         let mut r = result("call", "", "", true, 200);
-        r.status = Some(200);
+        r.http_status = Some(200);
         let rs = results(&[r]);
-        let out = render("status={{tasks.call.status}}", &rs, &no_globals(), &no_params(), no_cid()).unwrap();
+        let out = render("status={{tasks.call.http_status}}", &rs, &no_globals(), &no_params(), no_cid()).unwrap();
         assert_eq!(out, "status=200");
     }
 

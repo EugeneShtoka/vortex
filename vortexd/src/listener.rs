@@ -6,12 +6,15 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
+
+use vortex_core::TriggerStatus;
 
 use crate::config::Config;
 use crate::engine::{Engine, TaskResult};
 use crate::event::Event;
+use crate::store::Store;
 use crate::template;
 
 #[derive(Debug, Deserialize)]
@@ -22,23 +25,23 @@ struct TriggerRequest {
     id: Option<String>,
 }
 
-pub async fn serve(config: Arc<Config>, event_tx: broadcast::Sender<Event>) -> Result<()> {
-    let socket_path = &config.server.unix_socket;
+pub async fn serve(config_rx: watch::Receiver<Arc<Config>>, event_tx: broadcast::Sender<Event>) -> Result<()> {
+    let socket_path = config_rx.borrow().server.unix_socket.clone();
 
-    if std::path::Path::new(socket_path).exists() {
-        std::fs::remove_file(socket_path)?;
+    if std::path::Path::new(&socket_path).exists() {
+        std::fs::remove_file(&socket_path)?;
     }
 
-    let listener = UnixListener::bind(socket_path)?;
-    info!(socket = socket_path, "Listening on Unix socket");
+    let listener = UnixListener::bind(&socket_path)?;
+    info!(socket = %socket_path, "Listening on Unix socket");
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let config = Arc::clone(&config);
+                let rx = config_rx.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, config, tx).await {
+                    if let Err(e) = handle_connection(stream, rx, tx).await {
                         error!("Connection error: {e:#}");
                     }
                 });
@@ -50,7 +53,7 @@ pub async fn serve(config: Arc<Config>, event_tx: broadcast::Sender<Event>) -> R
 
 async fn handle_connection(
     mut stream: UnixStream,
-    config: Arc<Config>,
+    config_rx: watch::Receiver<Arc<Config>>,
     event_tx: broadcast::Sender<Event>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
@@ -71,7 +74,7 @@ async fn handle_connection(
                 warn!("Malformed request: {e}");
                 json!({ "status": "error", "message": format!("Invalid JSON: {e}") })
             }
-            Ok(req) => handle_request(req, &config, &event_tx).await,
+            Ok(req) => handle_request(req, &config_rx, &event_tx).await,
         };
 
         let mut payload = serde_json::to_string(&response)?;
@@ -84,7 +87,7 @@ async fn handle_connection(
 
 async fn handle_request(
     req: TriggerRequest,
-    config: &Arc<Config>,
+    config_rx: &watch::Receiver<Arc<Config>>,
     event_tx: &broadcast::Sender<Event>,
 ) -> serde_json::Value {
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -97,6 +100,16 @@ async fn handle_request(
     }
 
     info!(workflow = %req.workflow, "Trigger received on UDS");
+    let received_at = vortex_core::now_ms();
+    let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".into());
+    let config = config_rx.borrow().clone();
+    let store = Store::open(&config.server.db_path).ok();
+    if let Some(ref s) = store {
+        if let Err(e) = s.insert_trigger(&run_id, &req.workflow, &params_json, "uds", None, received_at) {
+            warn!("Failed to insert trigger: {e:#}");
+        }
+    }
+
     event_tx.send(Event::TriggerReceived {
         run_id: run_id.clone(),
         workflow: req.workflow.clone(),
@@ -105,12 +118,19 @@ async fn handle_request(
 
     let Some(workflow_config) = config.workflows.get(&req.workflow) else {
         warn!(workflow = %req.workflow, "Unknown workflow");
+        if let Some(ref s) = store {
+            let _ = s.update_trigger_status(&run_id, TriggerStatus::Rejected, Some("workflow_not_found"), Some(vortex_core::now_ms()));
+        }
         event_tx.send(Event::TriggerRejected { run_id, reason: "unknown_workflow".into() }).ok();
         let cid = correlation_id_fallback(&params);
         return json!({ "id": cid, "status": "error", "message": format!("unknown workflow: {}", req.workflow) });
     };
 
     let correlation_id = compute_correlation_id(workflow_config, &params);
+
+    if let Some(ref s) = store {
+        let _ = s.update_trigger_status(&run_id, TriggerStatus::Accepted, None, None);
+    }
 
     event_tx.send(Event::TriggerAccepted {
         run_id: run_id.clone(),
@@ -161,7 +181,7 @@ async fn execute_workflow(
 /// response — callers fall through to their default behavior.
 fn workflow_response(results: &[TaskResult]) -> Option<serde_json::Value> {
     results.iter()
-        .filter(|r| r.success && r.response.is_some())
+        .filter(|r| r.is_success() && r.response.is_some())
         .last()
         .and_then(|r| {
             let s = r.response.as_deref()?;
@@ -205,6 +225,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
+    use tokio::sync::watch;
 
     fn test_db_path() -> String {
         std::env::temp_dir()
@@ -212,7 +233,7 @@ mod tests {
             .to_str().unwrap().to_string()
     }
 
-    fn make_config(socket_path: &str) -> Arc<Config> {
+    fn make_config(socket_path: &str) -> watch::Receiver<Arc<Config>> {
         let mut workflows = std::collections::HashMap::new();
         workflows.insert(
             "greet".into(),
@@ -226,9 +247,11 @@ mod tests {
                 }],
                 cron: None,
                 correlation_id: None,
+                status_eval: None,
+                log_retention: None,
             },
         );
-        Arc::new(Config {
+        let (_, rx) = watch::channel(Arc::new(Config {
             server: ServerConfig {
                 unix_socket: socket_path.into(),
                 network: None,
@@ -237,7 +260,8 @@ mod tests {
             workflows,
             inputs: Default::default(),
             email: None,
-        })
+        }));
+        rx
     }
 
     async fn send_and_recv(socket_path: &str, msg: &str) -> String {
@@ -306,14 +330,16 @@ mod tests {
             }],
             cron: None,
             correlation_id: None,
+            status_eval: None,
+            log_retention: None,
         });
-        let config = Arc::new(Config {
+        let (_, config_rx) = watch::channel(Arc::new(Config {
             server: ServerConfig { unix_socket: socket_path.clone(), network: None, db_path: test_db_path() },
             workflows,
             inputs: Default::default(),
             email: None,
-        });
-        tokio::spawn(serve(config, tx));
+        }));
+        tokio::spawn(serve(config_rx, tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let resp = send_and_recv(&socket_path, r#"{"workflow":"output-wf","params":{"id":"req-1"}}"#).await;
@@ -344,14 +370,16 @@ mod tests {
             }],
             cron: None,
             correlation_id: None,
+            status_eval: None,
+            log_retention: None,
         });
-        let config = Arc::new(Config {
+        let (_, config_rx) = watch::channel(Arc::new(Config {
             server: ServerConfig { unix_socket: socket_path.clone(), network: None, db_path: test_db_path() },
             workflows,
             inputs: Default::default(),
             email: None,
-        });
-        tokio::spawn(serve(config, tx));
+        }));
+        tokio::spawn(serve(config_rx, tx));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let resp = send_and_recv(

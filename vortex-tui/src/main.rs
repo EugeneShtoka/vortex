@@ -18,8 +18,9 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use app::{App, ConnectionStatus, RunDetailDto};
-use config::TuiConfig;
+use app::{App, ConnectionStatus, LogEntry, RunDetailDto, TriggerSummaryDto, WorkflowIssueSummary};
+use std::collections::HashMap;
+use config::{TuiConfig, ViewMode};
 use graph::{DependencyGraph, WorkflowConfigDto};
 use ws::WsMsg;
 
@@ -47,9 +48,16 @@ async fn main() -> Result<()> {
     let source_names: Vec<&str> = cfg.sources.iter().map(|s| s.name.as_str()).collect();
     let mut app = App::with_source_names(&source_names);
 
-    // Pre-populate history for all sources in parallel
+    // Apply layout config and default view mode per source
+    for (i, src_cfg) in cfg.sources.iter().enumerate() {
+        app.sources[i].layout = src_cfg.layout.clone();
+        app.sources[i].set_view_mode(src_cfg.layout.default_mode.clone());
+    }
+
+    // Pre-populate history for all sources
     let client = reqwest::Client::new();
     for (i, src) in cfg.sources.iter().enumerate() {
+        // Fetch run history
         let history_url = format!("{}/runs?limit={}", src.http_base, src.history_limit);
         if let Ok(resp) = client.get(&history_url)
             .header("Authorization", format!("Bearer {}", src.token))
@@ -68,6 +76,26 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+        // Fetch trigger history (runs must be loaded first for cross-referencing)
+        let triggers_url = format!("{}/triggers?limit={}", src.http_base, src.history_limit);
+        if let Ok(resp) = client.get(&triggers_url)
+            .header("Authorization", format!("Bearer {}", src.token))
+            .send().await
+        {
+            if let Ok(dtos) = resp.json::<Vec<TriggerSummaryDto>>().await {
+                app.sources[i].apply_triggers(dtos);
+            }
+        }
+        // Fetch workflow validation issues
+        let workflows_url = format!("{}/workflows", src.http_base);
+        if let Ok(resp) = client.get(&workflows_url)
+            .header("Authorization", format!("Bearer {}", src.token))
+            .send().await
+        {
+            if let Ok(summaries) = resp.json::<Vec<WorkflowIssueSummary>>().await {
+                app.sources[i].apply_workflow_summaries(summaries);
             }
         }
     }
@@ -106,6 +134,28 @@ async fn main() -> Result<()> {
     result
 }
 
+async fn fetch_task_logs(http_base: &str, token: &str, run_id: &str, task_id: &str) -> Option<Vec<LogEntry>> {
+    let url = format!("{http_base}/runs/{run_id}/tasks/{task_id}/logs");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send().await.ok()?;
+    if resp.status().is_success() {
+        resp.json::<Vec<LogEntry>>().await.ok()
+    } else {
+        None
+    }
+}
+
+async fn fetch_globals(http_base: &str, token: &str) -> Option<HashMap<String, String>> {
+    let url = format!("{http_base}/globals");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send().await.ok()?;
+    resp.json::<HashMap<String, String>>().await.ok()
+}
+
 async fn fetch_graph(http_base: &str, token: &str, workflow: &str) -> Option<DependencyGraph> {
     let url = format!("{http_base}/workflows/{workflow}/config");
     let resp = reqwest::Client::new()
@@ -123,25 +173,26 @@ async fn run_loop(
     cfg: &TuiConfig,
 ) -> Result<()> {
     let tick = Duration::from_millis(100);
-    // Track (active_source_idx, selected_workflow_idx) to detect selection changes
-    let mut last_graph_key: Option<(usize, usize)> = None;
 
-    // Load graph for initial selection of the active source
-    {
-        let src_state = app.active_source();
-        let workflow = src_state.workflow_names().into_iter().next();
-        if let Some(wf) = workflow {
-            let src = &cfg.sources[app.active];
-            if let Some(g) = fetch_graph(&src.http_base, &src.token, &wf).await {
-                app.set_graph(g);
-            }
+    // Load graph for the initial selection and seed the tracking key
+    let initial_workflow = app.active_source().workflow_names().into_iter().next();
+    let mut last_graph_key: Option<(usize, Option<String>)> = Some((app.active, initial_workflow.clone()));
+    if let Some(ref wf) = initial_workflow {
+        let src = &cfg.sources[app.active];
+        if let Some(g) = fetch_graph(&src.http_base, &src.token, wf).await {
+            app.set_graph(g);
         }
     }
+
+    // Track selected task to fetch logs lazily
+    let mut last_task_key: Option<(usize, String, String)> = None; // (src_idx, run_id, task_id)
 
     loop {
         terminal.draw(|f| ui::render(f, &app))?;
 
-        // Drain all pending WS messages
+        // Drain all pending WS messages; track runs needing globals snapshots
+        let mut globals_pre_needed:  Vec<(usize, String)> = Vec::new();
+        let mut globals_post_needed: Vec<(usize, String)> = Vec::new();
         while let Ok((src_idx, msg)) = event_rx.try_recv() {
             match msg {
                 WsMsg::Connected => {
@@ -150,6 +201,12 @@ async fn run_loop(
                     }
                 }
                 WsMsg::AppEvent(event) => {
+                    use vortex_core::Event;
+                    match &event {
+                        Event::WorkflowStarted  { run_id, .. } => globals_pre_needed.push((src_idx, run_id.clone())),
+                        Event::WorkflowFinished { run_id, .. } => globals_post_needed.push((src_idx, run_id.clone())),
+                        _ => {}
+                    }
                     app.handle_sourced(src_idx, event);
                 }
                 WsMsg::Disconnected(err) => {
@@ -160,12 +217,38 @@ async fn run_loop(
             }
         }
 
+        // Fetch globals snapshots for runs that just started/finished
+        for (src_idx, run_id) in globals_pre_needed {
+            if let Some(src_cfg) = cfg.sources.get(src_idx) {
+                if let Some(g) = fetch_globals(&src_cfg.http_base, &src_cfg.token).await {
+                    if let Some(src) = app.sources.get_mut(src_idx) {
+                        src.apply_globals_pre(&run_id, g);
+                    }
+                }
+            }
+        }
+        for (src_idx, run_id) in globals_post_needed {
+            if let Some(src_cfg) = cfg.sources.get(src_idx) {
+                if let Some(g) = fetch_globals(&src_cfg.http_base, &src_cfg.token).await {
+                    if let Some(src) = app.sources.get_mut(src_idx) {
+                        src.apply_globals_post(&run_id, g);
+                    }
+                }
+            }
+        }
+
         if event::poll(tick)? {
             if let CrosstermEvent::Key(key) = event::read()? {
                 use app::Focus;
-                let in_detail = app.active_source().focus == Focus::TaskDetail;
+                let in_detail = app.active_source().focus == Focus::Detail;
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q') | KeyCode::Char('Q'), _) => break,
+                    (KeyCode::Char('t') | KeyCode::Char('T'), _) if !in_detail => {
+                        app.set_view_mode(ViewMode::Triggers);
+                    }
+                    (KeyCode::Char('w') | KeyCode::Char('W'), _) if !in_detail => {
+                        app.jump_to_workflow_view();
+                    }
                     (KeyCode::Char('g') | KeyCode::Char('G'), _) if !in_detail => {
                         app.toggle_graph();
                     }
@@ -191,6 +274,8 @@ async fn run_loop(
                         app.active_source_mut().show_graph = false;
                         app.enter_pane();
                     }
+                    (KeyCode::Char('['), _) => app.panels_narrower(),
+                    (KeyCode::Char(']'), _) => app.panels_wider(),
                     (KeyCode::Esc, _) => {
                         if app.active_source().show_graph {
                             app.active_source_mut().show_graph = false;
@@ -203,18 +288,49 @@ async fn run_loop(
             }
         }
 
-        // Fetch workflow graph when (active source, selected workflow) changes
-        let current_key = Some((app.active, app.active_source().selected_workflow));
-        if last_graph_key != current_key {
-            last_graph_key = current_key;
-            let workflow = app.active_source()
-                .workflow_names()
-                .into_iter()
-                .nth(app.active_source().selected_workflow);
-            if let Some(wf) = workflow {
+        // Fetch task logs lazily when selected task changes
+        let task_key: Option<(usize, String, String)> = {
+            let src = app.active_source();
+            src.selected_task_entry()
+                .and_then(|(task_id, _)| src.selected_active_run().map(|(run_id, _)| (app.active, run_id.clone(), task_id.clone())))
+        };
+        if task_key != last_task_key {
+            last_task_key = task_key.clone();
+            if let Some((src_idx, ref run_id, ref task_id)) = task_key {
+                let key = (run_id.clone(), task_id.clone());
+                let already_cached = app.sources.get(src_idx)
+                    .map(|s| s.task_logs.contains_key(&key))
+                    .unwrap_or(false);
+                if !already_cached {
+                    if let Some(src_cfg) = cfg.sources.get(src_idx) {
+                        if let Some(logs) = fetch_task_logs(&src_cfg.http_base, &src_cfg.token, run_id, task_id).await {
+                            if let Some(src) = app.sources.get_mut(src_idx) {
+                                src.apply_task_logs(run_id, task_id, logs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fetch workflow graph when selection changes (mode-aware)
+        let graph_key = {
+            let src = app.active_source();
+            let wf = match src.view_mode {
+                ViewMode::Triggers => src.selected_trigger_entry()
+                    .and_then(|t| t.workflow.clone()),
+                ViewMode::Workflows => src.workflow_names()
+                    .into_iter()
+                    .nth(src.selected_workflow),
+            };
+            Some((app.active, wf))
+        };
+        if last_graph_key != graph_key {
+            last_graph_key = graph_key.clone();
+            if let Some((_, Some(wf))) = &graph_key {
                 if !wf.is_empty() {
                     let src = &cfg.sources[app.active];
-                    if let Some(g) = fetch_graph(&src.http_base, &src.token, &wf).await {
+                    if let Some(g) = fetch_graph(&src.http_base, &src.token, wf).await {
                         app.set_graph(g);
                     }
                 }

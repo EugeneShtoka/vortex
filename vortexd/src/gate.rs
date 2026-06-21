@@ -5,6 +5,7 @@ use anyhow::Result;
 use cel_interpreter::{Context, ExecutionError, Program, Value};
 
 use crate::engine::TaskResult;
+use vortex_core::TaskStatus;
 
 /// Evaluate a CEL gate expression against the full workflow context.
 /// Returns `bool`; undeclared variable references → `false` (task not yet run).
@@ -115,7 +116,7 @@ pub fn evaluate_value(
 /// Used to bind `self` when evaluating `abort_if` expressions.
 pub fn task_result_to_cel(result: &TaskResult) -> Result<Value> {
     let json = serde_json::json!({
-        "success":   result.success,
+        "success":   result.is_success(),
         "stdout":    result.stdout.trim(),
         "stderr":    result.stderr.trim(),
         "exit_code": result.exit_code,
@@ -139,7 +140,7 @@ fn build_context<'a>(
         for &id in all_ids {
             let entry = match results.get(id) {
                 Some(r) => serde_json::json!({
-                    "success":   r.success,
+                    "success":   r.is_success(),
                     "stdout":    r.stdout.trim(),
                     "stderr":    r.stderr.trim(),
                     "exit_code": r.exit_code,
@@ -191,11 +192,12 @@ fn build_context<'a>(
     // Custom functions
     ctx.add_function("toMap", cel_to_map);
     ctx.add_function("merge", cel_merge);
+    ctx.add_function("localpart", cel_localpart);
 
     // backward compat: bare task-ID booleans for `when = "task_id"` style
     for &id in all_ids {
         if is_cel_ident(id) {
-            let success = results.get(id).map_or(false, |r| r.success);
+            let success = results.get(id).map_or(false, |r| r.is_success());
             if let Ok(v) = to_cel(&success) {
                 ctx.add_variable_from_value(id, v);
             }
@@ -222,6 +224,15 @@ fn cel_to_map(list: Arc<Vec<Value>>, key_field: Arc<String>, val: Arc<String>) -
     }
     cel_interpreter::to_value(&serde_json::Value::Object(obj))
         .map_err(|e| ExecutionError::function_error("toMap", e))
+}
+
+/// `localpart(s)` — extracts the local part of a Matrix ID: `@alice:server` → `alice`.
+fn cel_localpart(s: Arc<String>) -> Result<Value, ExecutionError> {
+    let local = s.as_str()
+        .strip_prefix('@')
+        .and_then(|p| p.split(':').next())
+        .unwrap_or(s.as_str());
+    Ok(Value::String(local.to_string().into()))
 }
 
 /// `merge(a, b)` — merges two CEL maps (b wins on conflict) or concatenates two lists.
@@ -283,8 +294,9 @@ mod tests {
     fn r(id: &str, success: bool) -> (String, TaskResult) {
         (id.to_string(), TaskResult {
             id: id.into(), stdout: String::new(), stderr: String::new(),
-            exit_code: if success { 0 } else { 1 }, success,
-            output: None, status: None, response: None,
+            exit_code: if success { 0 } else { 1 },
+            status: if success { TaskStatus::Success } else { TaskStatus::Failed },
+            output: None, http_status: None, response: None,
         })
     }
 
