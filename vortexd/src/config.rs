@@ -129,18 +129,23 @@ fn default_method() -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct InputsConfig {
     #[serde(default)]
-    pub ntfy: Vec<NtfyListenerConfig>,
+    pub sse: Vec<SseListenerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct NtfyListenerConfig {
-    pub server: String,
-    pub topic: String,
-    pub workflow: String,
-    pub auth_method: Option<String>,
-    pub auth_key: Option<String>,
+pub struct SseListenerConfig {
+    pub url:          String,
+    pub workflow:     String,
+    pub auth_method:  Option<String>,
+    pub auth_key:     Option<String>,
+    /// Top-level JSON keys to promote to trigger params.
     #[serde(default)]
-    pub params: HashMap<String, String>,
+    pub fields:       Vec<String>,
+    /// If set, only process lines where `.event == event_filter`.
+    pub event_filter: Option<String>,
+    /// Static extra params merged into every trigger.
+    #[serde(default)]
+    pub params:       HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,20 +319,43 @@ tasks = [{ id = "t", type = "http", url = "https://example.com" }]
     }
 
     #[test]
-    fn parses_ntfy_input_config() {
+    fn parses_sse_input_config() {
         let toml = r#"
 [server]
 unix_socket = "/tmp/v.sock"
 
-[[inputs.ntfy]]
-server   = "https://ntfy.sh"
-topic    = "alerts"
+[[inputs.sse]]
+url      = "https://ntfy.example.com/alerts/json"
 workflow = "handle_alert"
+fields   = ["message", "title", "topic"]
+
+[[inputs.sse]]
+url          = "https://other.example.com/events"
+workflow     = "handle_other"
+event_filter = "update"
+auth_method  = "env"
+auth_key     = "SSE_TOKEN"
+fields       = ["data", "id"]
+
+[inputs.sse.params]
+source = "other"
 "#;
         let cfg = parse_config(toml).unwrap();
-        assert_eq!(cfg.inputs.ntfy.len(), 1);
-        assert_eq!(cfg.inputs.ntfy[0].topic, "alerts");
-        assert_eq!(cfg.inputs.ntfy[0].workflow, "handle_alert");
+        assert_eq!(cfg.inputs.sse.len(), 2);
+        let first = &cfg.inputs.sse[0];
+        assert_eq!(first.url, "https://ntfy.example.com/alerts/json");
+        assert_eq!(first.workflow, "handle_alert");
+        assert_eq!(first.fields, vec!["message", "title", "topic"]);
+        assert!(first.event_filter.is_none());
+        let second = &cfg.inputs.sse[1];
+        assert_eq!(second.event_filter.as_deref(), Some("update"));
+        assert_eq!(second.params["source"], "other");
+    }
+
+    #[test]
+    fn sse_input_empty_by_default() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert!(cfg.inputs.sse.is_empty());
     }
 
     #[test]

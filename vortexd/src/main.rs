@@ -4,7 +4,7 @@ mod engine;
 mod event;
 mod gate;
 mod listener;
-mod ntfy;
+mod sse;
 mod scheduler;
 mod server;
 mod store;
@@ -38,11 +38,11 @@ async fn main() -> Result<()> {
 
     scheduler::run(config_rx.clone(), event_tx.clone()).await;
 
-    let ntfy_cfgs = config_rx.borrow().inputs.ntfy.clone();
-    for ntfy_cfg in ntfy_cfgs {
+    let sse_cfgs = config_rx.borrow().inputs.sse.clone();
+    for sse_cfg in sse_cfgs {
         let rx = config_rx.clone();
         let tx = event_tx.clone();
-        tokio::spawn(async move { ntfy::listen(ntfy_cfg, rx, tx).await });
+        tokio::spawn(async move { sse::listen(sse_cfg, rx, tx).await });
     }
 
     let uds_handle = {
