@@ -22,6 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 cel-interpreter = "0.10"
+regex = "1"
 handlebars = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws"] }

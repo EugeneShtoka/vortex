@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cel_interpreter::{Context, ExecutionError, Program, Value};
+use regex::Regex;
 
 use crate::engine::TaskResult;
 use vortex_core::TaskStatus;
@@ -193,6 +194,7 @@ fn build_context<'a>(
     ctx.add_function("toMap", cel_to_map);
     ctx.add_function("merge", cel_merge);
     ctx.add_function("localpart", cel_localpart);
+    ctx.add_function("regex_replace", cel_regex_replace);
 
     // backward compat: bare task-ID booleans for `when = "task_id"` style
     for &id in all_ids {
@@ -233,6 +235,13 @@ fn cel_localpart(s: Arc<String>) -> Result<Value, ExecutionError> {
         .and_then(|p| p.split(':').next())
         .unwrap_or(s.as_str());
     Ok(Value::String(local.to_string().into()))
+}
+
+/// `regex_replace(s, pattern, replacement)` — replaces the first match of `pattern` in `s`.
+fn cel_regex_replace(s: Arc<String>, pattern: Arc<String>, replacement: Arc<String>) -> Result<Value, ExecutionError> {
+    let re = Regex::new(&pattern)
+        .map_err(|e| ExecutionError::function_error("regex_replace", e))?;
+    Ok(Value::String(Arc::new(re.replace(&s, replacement.as_str()).into_owned())))
 }
 
 /// `merge(a, b)` — merges two CEL maps (b wins on conflict) or concatenates two lists.

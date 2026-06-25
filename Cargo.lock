@@ -2787,6 +2787,7 @@ dependencies = [
  "futures-util",
  "handlebars",
  "lettre",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
