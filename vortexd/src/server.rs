@@ -11,7 +11,7 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,8 @@ struct TaskConfigDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     exec: Option<String>,
     when: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depends_on: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +192,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/runs", get(list_runs).layer(authed.clone()))
         .route("/runs/{run_id}", get(get_run).layer(authed.clone()))
         .route("/globals", get(get_globals).layer(authed.clone()))
+        .route("/globals/{key}", put(put_global).delete(delete_global).layer(authed.clone()))
         .route("/triggers", get(list_triggers).layer(authed.clone()))
         .route("/triggers/{trigger_id}", get(get_trigger).layer(authed.clone()))
         .route("/workflows",              get(list_workflows).layer(authed.clone()))
@@ -460,6 +463,37 @@ async fn get_globals(
     }
 }
 
+async fn put_global(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body: String,
+) -> Response {
+    let config = state.config.borrow().clone();
+    let store = match Store::open(&config.server.db_path) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match store.set(&key, body.trim()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn delete_global(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Response {
+    let config = state.config.borrow().clone();
+    let store = match Store::open(&config.server.db_path) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match store.delete(&key) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn get_workflow_config(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -474,6 +508,7 @@ async fn get_workflow_config(
                     id: t.id.clone(),
                     exec: if let crate::config::TaskKind::Shell { exec } = &t.kind { Some(exec.clone()) } else { None },
                     when: t.when.clone(),
+                    depends_on: t.depends_on.clone(),
                 }).collect(),
             };
             Json(dto).into_response()

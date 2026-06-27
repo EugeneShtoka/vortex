@@ -12,6 +12,8 @@ pub struct TaskConfigDto {
     #[serde(default)]
     pub exec: Option<String>,
     pub when: Option<String>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +44,7 @@ impl DependencyGraph {
             .tasks
             .iter()
             .map(|t| {
-                let deps = extract_deps(t.when.as_deref(), &task_ids);
+                let deps = extract_deps(t.when.as_deref(), t.depends_on.as_deref(), &task_ids);
                 TaskNode { id: t.id.clone(), when: t.when.clone(), deps, depth: 0 }
             })
             .collect();
@@ -61,18 +63,31 @@ impl DependencyGraph {
     }
 }
 
-fn extract_deps(when: Option<&str>, task_ids: &std::collections::HashMap<&str, usize>) -> Vec<String> {
-    let Some(expr) = when else { return vec![] };
+fn extract_deps(when: Option<&str>, depends_on: Option<&[String]>, task_ids: &std::collections::HashMap<&str, usize>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut deps = vec![];
-    for token in expr.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
-        if token.is_empty() || matches!(token, "AND" | "OR" | "NOT") {
-            continue;
-        }
-        if task_ids.contains_key(token) && seen.insert(token.to_string()) {
-            deps.push(token.to_string());
+
+    // Explicit depends_on takes priority
+    if let Some(explicit) = depends_on {
+        for dep in explicit {
+            if task_ids.contains_key(dep.as_str()) && seen.insert(dep.clone()) {
+                deps.push(dep.clone());
+            }
         }
     }
+
+    // Also extract implicit deps from when expression
+    if let Some(expr) = when {
+        for token in expr.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+            if token.is_empty() || matches!(token, "AND" | "OR" | "NOT") {
+                continue;
+            }
+            if task_ids.contains_key(token) && seen.insert(token.to_string()) {
+                deps.push(token.to_string());
+            }
+        }
+    }
+
     deps
 }
 
@@ -108,6 +123,7 @@ mod tests {
                 id: id.to_string(),
                 exec: None,
                 when: when.map(str::to_string),
+                depends_on: None,
             }).collect(),
         }
     }

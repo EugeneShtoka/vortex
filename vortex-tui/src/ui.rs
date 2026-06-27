@@ -6,9 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ConnectionStatus, Focus, GlobalsDiffEntry, RunStatus, SourceState, TaskStatus, TriggerEntry, TriggerEntryStatus, diff_globals};
+use crate::app::{App, ConnectionStatus, Focus, GlobalsDiffEntry, GlobalsEditState, RunStatus, SourceState, TaskStatus, TriggerEntry, TriggerEntryStatus, diff_globals};
 use crate::config::ViewMode;
-use crate::graph::TaskNode;
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -57,6 +56,9 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if src.show_graph {
         render_graph_modal(f, src, area);
+    }
+    if src.show_globals {
+        render_globals_modal(f, src, area);
     }
 }
 
@@ -741,7 +743,7 @@ fn render_task_detail(f: &mut Frame, src: &SourceState, area: Rect) {
 fn render_graph_modal(f: &mut Frame, src: &SourceState, area: Rect) {
     let Some(graph) = &src.graph else { return };
 
-    let modal = centered_rect(80, 80, area);
+    let modal = centered_rect(80, 85, area);
     f.render_widget(Clear, modal);
 
     let title = format!(" DAG: {} ", graph.workflow);
@@ -755,65 +757,179 @@ fn render_graph_modal(f: &mut Frame, src: &SourceState, area: Rect) {
 
     let task_statuses = src.selected_run_in_workflow().map(|(_, r)| &r.tasks);
 
+    // Group nodes by depth to show them in columns (depth 0 = roots, depth 1, ...)
+    let max_depth = graph.nodes.iter().map(|n| n.depth).max().unwrap_or(0);
+
     let mut lines: Vec<Line> = Vec::new();
+
+    // Header showing depth levels
+    if max_depth > 0 {
+        let mut header_spans = vec![];
+        for d in 0..=max_depth {
+            let label = if d == 0 { "root".to_string() } else { format!("depth {d}") };
+            header_spans.push(Span::styled(
+                format!("  {label:<14}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(header_spans));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     for node in &graph.nodes {
-        lines.push(task_line(node, task_statuses));
+        let indent = "  ".repeat(node.depth);
+        let (symbol, color) = task_statuses
+            .and_then(|ts| ts.get(&node.id))
+            .map(|status| match status {
+                TaskStatus::Running                         => ("▶", Color::Yellow),
+                TaskStatus::Finished { success: true, .. }  => ("✓", Color::Green),
+                TaskStatus::Finished { success: false, .. } => ("✗", Color::Red),
+                TaskStatus::Skipped                         => ("─", Color::DarkGray),
+            })
+            .unwrap_or(("○", Color::DarkGray));
+
+        lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(format!("{symbol} "), Style::default().fg(color)),
+            Span::styled(node.id.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+
         if !node.deps.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  deps: {}", node.deps.join(", ")),
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled("  needs: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(node.deps.join(", "), Style::default().fg(Color::White)),
+            ]));
         }
+
         if let Some(expr) = &node.when {
-            lines.push(Line::from(Span::styled(
-                format!("  when: {expr}"),
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled("  when:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(expr.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
         }
+
         lines.push(Line::from(""));
     }
 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn task_line<'a>(
-    node: &'a TaskNode,
-    task_statuses: Option<&'a indexmap::IndexMap<String, TaskStatus>>,
-) -> Line<'a> {
-    let (symbol, color) = task_statuses
-        .and_then(|ts| ts.get(&node.id))
-        .map(|status| match status {
-            TaskStatus::Running                         => ("▶", Color::Yellow),
-            TaskStatus::Finished { success: true, .. }  => ("✓", Color::Green),
-            TaskStatus::Finished { success: false, .. } => ("✗", Color::Red),
-            TaskStatus::Skipped                         => ("─", Color::DarkGray),
-        })
-        .unwrap_or(("○", Color::DarkGray));
-
-    let indent = "  ".repeat(node.depth);
-    Line::from(vec![
-        Span::styled(format!("{indent}{symbol} "), Style::default().fg(color)),
-        Span::styled(node.id.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ])
-}
-
 fn render_statusbar(f: &mut Frame, src: &SourceState, area: Rect) {
-    let text = match src.focus {
-        Focus::TriggerList =>
-            " q: quit   j/k ↑↓: triggers   l/→/Enter: runs   Tab: next source   T/W: mode   [/]: panels",
-        Focus::WorkflowList =>
-            " q: quit   j/k ↑↓: workflows   l/→/Enter: runs   Tab: next source   T/W: mode   [/]: panels",
-        Focus::Runs =>
-            " q: quit   j/k ↑↓: runs   h/←/Esc: back   l/→/Enter: tasks   Tab: next source   [/]: panels",
-        Focus::Tasks =>
-            " q: quit   j/k ↑↓: tasks   h/←/Esc: back   l/→: detail   g: graph   [/]: panels",
-        Focus::Detail =>
-            " q: quit   j/k ↑↓: scroll   h/←/Esc: back",
+    let text = if src.show_globals {
+        match &src.globals_edit {
+            GlobalsEditState::None =>
+                " Esc/q: close   j/k: navigate   e: edit   n: new   d: delete",
+            GlobalsEditState::EditingValue { .. } =>
+                " Enter: save   Esc: cancel   type to edit value",
+            GlobalsEditState::AddingKey { .. } =>
+                " Enter: confirm key   Esc: cancel   type key name",
+            GlobalsEditState::AddingValue { .. } =>
+                " Enter: save   Esc: back to key   type value",
+        }
+    } else {
+        match src.focus {
+            Focus::TriggerList =>
+                " q: quit   j/k ↑↓: triggers   l/→/Enter: runs   Tab: next source   T/W: mode   G: globals   [/]: panels",
+            Focus::WorkflowList =>
+                " q: quit   j/k ↑↓: workflows   l/→/Enter: runs   Tab: next source   T/W: mode   G: globals   [/]: panels",
+            Focus::Runs =>
+                " q: quit   j/k ↑↓: runs   h/←/Esc: back   l/→/Enter: tasks   Tab: next source   [/]: panels",
+            Focus::Tasks =>
+                " q: quit   j/k ↑↓: tasks   h/←/Esc: back   l/→: detail   g: graph   G: globals   [/]: panels",
+            Focus::Detail =>
+                " q: quit   j/k ↑↓: scroll   h/←/Esc: back",
+        }
     };
     f.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+fn render_globals_modal(f: &mut Frame, src: &SourceState, area: Rect) {
+    let modal = centered_rect(70, 80, area);
+    f.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Globals ")
+        .title_alignment(Alignment::Left);
+
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    // Split: list on top, input prompt at bottom when editing
+    let editing = !matches!(&src.globals_edit, GlobalsEditState::None);
+    let chunks = if editing {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1)])
+            .split(inner)
+    };
+
+    // --- key/value list ---
+    let keys = src.globals_sorted_keys();
+    let mut lines: Vec<Line> = Vec::new();
+
+    if keys.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no globals set)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, k) in keys.iter().enumerate() {
+            let val = src.globals_current.get(k).map(String::as_str).unwrap_or("");
+            let selected = i == src.globals_selected;
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {k}"), style.add_modifier(Modifier::BOLD)),
+                Span::styled(" = ", Style::default().fg(Color::DarkGray)),
+                Span::styled(val.to_string(), style),
+            ]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    // --- input prompt when editing ---
+    if editing {
+        let (prompt, buf) = match &src.globals_edit {
+            GlobalsEditState::EditingValue { key, buf } =>
+                (format!(" edit {key}: "), buf.as_str()),
+            GlobalsEditState::AddingKey { key_buf } =>
+                (" new key: ".to_string(), key_buf.as_str()),
+            GlobalsEditState::AddingValue { key, val_buf } =>
+                (format!(" value for {key}: "), val_buf.as_str()),
+            GlobalsEditState::None => unreachable!(),
+        };
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let input_inner = input_block.inner(chunks[1]);
+        f.render_widget(input_block, chunks[1]);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prompt, Style::default().fg(Color::DarkGray)),
+                Span::styled(buf, Style::default().fg(Color::White)),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ])),
+            input_inner,
+        );
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

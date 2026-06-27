@@ -139,6 +139,11 @@ impl Store {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    pub fn delete(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM globals WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     // ── runs ──────────────────────────────────────────────────────────────────
 
     pub fn insert_run(&self, id: &str, workflow: &str, params: &str, started_at: u64) -> Result<()> {

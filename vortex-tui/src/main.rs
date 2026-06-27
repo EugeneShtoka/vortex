@@ -18,7 +18,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
-use app::{App, ConnectionStatus, LogEntry, RunDetailDto, TriggerSummaryDto, WorkflowIssueSummary};
+use app::{App, ConnectionStatus, GlobalsEditState, LogEntry, RunDetailDto, TriggerSummaryDto, WorkflowIssueSummary};
 use std::collections::HashMap;
 use config::{TuiConfig, ViewMode};
 use graph::{DependencyGraph, WorkflowConfigDto};
@@ -134,6 +134,27 @@ async fn main() -> Result<()> {
     result
 }
 
+async fn put_global(http_base: &str, token: &str, key: &str, value: &str) -> bool {
+    let url = format!("{http_base}/globals/{key}");
+    reqwest::Client::new()
+        .put(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(value.to_string())
+        .send().await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn delete_global(http_base: &str, token: &str, key: &str) -> bool {
+    let url = format!("{http_base}/globals/{key}");
+    reqwest::Client::new()
+        .delete(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send().await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
 async fn fetch_task_logs(http_base: &str, token: &str, run_id: &str, task_id: &str) -> Option<Vec<LogEntry>> {
     let url = format!("{http_base}/runs/{run_id}/tasks/{task_id}/logs");
     let resp = reqwest::Client::new()
@@ -240,6 +261,118 @@ async fn run_loop(
         if event::poll(tick)? {
             if let CrosstermEvent::Key(key) = event::read()? {
                 use app::Focus;
+
+                // Globals modal has exclusive key handling when open
+                if app.active_source().show_globals {
+                    let src_idx = app.active;
+                    let src_cfg = &cfg.sources[src_idx];
+                    let edit_state = app.active_source().globals_edit.clone();
+                    match edit_state {
+                        GlobalsEditState::None => match key.code {
+                            KeyCode::Esc => app.close_globals(),
+                            KeyCode::Char('q') => app.close_globals(),
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.active_source_mut().globals_select_next();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.active_source_mut().globals_select_prev();
+                            }
+                            KeyCode::Char('e') => {
+                                if let Some(key_name) = app.active_source().globals_selected_key() {
+                                    let cur_val = app.active_source()
+                                        .globals_current.get(&key_name).cloned().unwrap_or_default();
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::EditingValue { key: key_name, buf: cur_val };
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                app.active_source_mut().globals_edit =
+                                    GlobalsEditState::AddingKey { key_buf: String::new() };
+                            }
+                            KeyCode::Char('d') => {
+                                if let Some(key_name) = app.active_source().globals_selected_key() {
+                                    delete_global(&src_cfg.http_base, &src_cfg.token, &key_name).await;
+                                    app.active_source_mut().apply_globals_delete();
+                                }
+                            }
+                            _ => {}
+                        },
+                        GlobalsEditState::EditingValue { key: ref k, ref buf } => {
+                            let k = k.clone();
+                            let mut buf = buf.clone();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.active_source_mut().globals_edit = GlobalsEditState::None;
+                                }
+                                KeyCode::Enter => {
+                                    put_global(&src_cfg.http_base, &src_cfg.token, &k, &buf).await;
+                                    app.active_source_mut().apply_globals_edit(k, buf);
+                                }
+                                KeyCode::Backspace => {
+                                    buf.pop();
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::EditingValue { key: k, buf };
+                                }
+                                KeyCode::Char(c) => {
+                                    buf.push(c);
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::EditingValue { key: k, buf };
+                                }
+                                _ => {}
+                            }
+                        }
+                        GlobalsEditState::AddingKey { ref key_buf } => {
+                            let mut key_buf = key_buf.clone();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.active_source_mut().globals_edit = GlobalsEditState::None;
+                                }
+                                KeyCode::Enter if !key_buf.is_empty() => {
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingValue { key: key_buf, val_buf: String::new() };
+                                }
+                                KeyCode::Backspace => {
+                                    key_buf.pop();
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingKey { key_buf };
+                                }
+                                KeyCode::Char(c) => {
+                                    key_buf.push(c);
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingKey { key_buf };
+                                }
+                                _ => {}
+                            }
+                        }
+                        GlobalsEditState::AddingValue { key: ref gname, ref val_buf } => {
+                            let gkey = gname.clone();
+                            let mut val_buf = val_buf.clone();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingKey { key_buf: gkey };
+                                }
+                                KeyCode::Enter => {
+                                    put_global(&src_cfg.http_base, &src_cfg.token, &gkey, &val_buf).await;
+                                    app.active_source_mut().apply_globals_edit(gkey, val_buf);
+                                }
+                                KeyCode::Backspace => {
+                                    val_buf.pop();
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingValue { key: gkey, val_buf };
+                                }
+                                KeyCode::Char(c) => {
+                                    val_buf.push(c);
+                                    app.active_source_mut().globals_edit =
+                                        GlobalsEditState::AddingValue { key: gkey, val_buf };
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let in_detail = app.active_source().focus == Focus::Detail;
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q') | KeyCode::Char('Q'), _) => break,
@@ -249,8 +382,14 @@ async fn run_loop(
                     (KeyCode::Char('w') | KeyCode::Char('W'), _) if !in_detail => {
                         app.jump_to_workflow_view();
                     }
-                    (KeyCode::Char('g') | KeyCode::Char('G'), _) if !in_detail => {
+                    (KeyCode::Char('g'), _) if !in_detail => {
                         app.toggle_graph();
+                    }
+                    (KeyCode::Char('G'), _) if !in_detail => {
+                        let src_cfg = &cfg.sources[app.active];
+                        if let Some(globals) = fetch_globals(&src_cfg.http_base, &src_cfg.token).await {
+                            app.open_globals(globals);
+                        }
                     }
                     (KeyCode::Tab, KeyModifiers::SHIFT) => app.prev_source(),
                     (KeyCode::Tab, _) => app.next_source(),

@@ -73,6 +73,14 @@ pub struct TaskSummary {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum GlobalsEditState {
+    None,
+    EditingValue { key: String, buf: String },
+    AddingKey { key_buf: String },
+    AddingValue { key: String, val_buf: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum GlobalsDiffEntry {
     Changed { key: String, before: String, after: String },
     Added   { key: String, value: String },
@@ -205,6 +213,10 @@ pub struct SourceState {
     pub layout: TuiLayout,
     pub graph: Option<DependencyGraph>,
     pub show_graph: bool,
+    pub show_globals: bool,
+    pub globals_current: HashMap<String, String>,
+    pub globals_selected: usize,
+    pub globals_edit: GlobalsEditState,
     pub globals_pre:  HashMap<String, HashMap<String, String>>,
     pub globals_post: HashMap<String, HashMap<String, String>>,
     /// task config fields cached from GET /runs/{id} — run_id → task_id → TaskSummary
@@ -234,6 +246,10 @@ impl SourceState {
             layout,
             graph: None,
             show_graph: false,
+            show_globals: false,
+            globals_current: HashMap::new(),
+            globals_selected: 0,
+            globals_edit: GlobalsEditState::None,
             globals_pre:  HashMap::new(),
             globals_post: HashMap::new(),
             task_summaries: HashMap::new(),
@@ -480,6 +496,60 @@ impl SourceState {
     pub fn toggle_graph(&mut self) {
         if self.graph.is_some() {
             self.show_graph = !self.show_graph;
+        }
+    }
+
+    pub fn open_globals(&mut self, globals: HashMap<String, String>) {
+        self.globals_current = globals;
+        self.globals_selected = self.globals_selected.min(self.globals_current.len().saturating_sub(1));
+        self.globals_edit = GlobalsEditState::None;
+        self.show_globals = true;
+    }
+
+    pub fn close_globals(&mut self) {
+        self.show_globals = false;
+        self.globals_edit = GlobalsEditState::None;
+    }
+
+    pub fn globals_sorted_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.globals_current.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    pub fn globals_select_next(&mut self) {
+        let count = self.globals_current.len();
+        if count > 0 {
+            self.globals_selected = (self.globals_selected + 1).min(count - 1);
+        }
+    }
+
+    pub fn globals_select_prev(&mut self) {
+        self.globals_selected = self.globals_selected.saturating_sub(1);
+    }
+
+    pub fn globals_selected_key(&self) -> Option<String> {
+        self.globals_sorted_keys().into_iter().nth(self.globals_selected)
+    }
+
+    pub fn apply_globals_edit(&mut self, key: String, value: String) {
+        self.globals_current.insert(key, value);
+        let count = self.globals_current.len();
+        if count > 0 {
+            self.globals_selected = self.globals_selected.min(count - 1);
+        }
+        self.globals_edit = GlobalsEditState::None;
+    }
+
+    pub fn apply_globals_delete(&mut self) {
+        if let Some(key) = self.globals_selected_key() {
+            self.globals_current.remove(&key);
+            let count = self.globals_current.len();
+            if count > 0 {
+                self.globals_selected = self.globals_selected.min(count - 1);
+            } else {
+                self.globals_selected = 0;
+            }
         }
     }
 
@@ -783,6 +853,8 @@ impl App {
     pub fn selected_run(&self) -> Option<(&String, &RunState)> { self.active_source().selected_run() }
     pub fn set_graph(&mut self, graph: DependencyGraph) { self.active_source_mut().set_graph(graph); }
     pub fn toggle_graph(&mut self) { self.active_source_mut().toggle_graph(); }
+    pub fn open_globals(&mut self, globals: HashMap<String, String>) { self.active_source_mut().open_globals(globals); }
+    pub fn close_globals(&mut self) { self.active_source_mut().close_globals(); }
     pub fn apply_run_detail(&mut self, detail: RunDetailDto) { self.active_source_mut().apply_run_detail(detail); }
 
     pub fn navigate_up(&mut self)   { self.active_source_mut().navigate_up(); }
@@ -1052,8 +1124,8 @@ mod tests {
         DependencyGraph::from_config(WorkflowConfigDto {
             name: workflow.into(),
             tasks: vec![
-                TaskConfigDto { id: "a".into(), exec: None, when: None },
-                TaskConfigDto { id: "b".into(), exec: None, when: Some("a".into()) },
+                TaskConfigDto { id: "a".into(), exec: None, when: None, depends_on: None },
+                TaskConfigDto { id: "b".into(), exec: None, when: Some("a".into()), depends_on: None },
             ],
         })
     }
